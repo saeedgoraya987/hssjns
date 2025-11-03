@@ -21,10 +21,9 @@ app.use(express.json({ limit: "2mb" }));
 // ---------- config ----------
 const MAX_CONCURRENCY = 16;                 // tweak for speed
 const PHONE_RE = /^\+?\d{8,18}$/;           // simple validation
-
-// ---------- helpers ----------
 const limit = pLimit(MAX_CONCURRENCY);
 
+// ---------- helpers ----------
 const normalizeNumber = (raw) => {
   if (raw === undefined || raw === null) return null;
   let s = String(raw).trim().replace(/[()\-\s]/g, "");
@@ -32,13 +31,16 @@ const normalizeNumber = (raw) => {
 };
 const toJid = (number) => number.replace(/\D/g, "") + "@s.whatsapp.net";
 const envelopeError = (statusCode, path, message) => ({
-  statusCode, timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"), path, message
+  statusCode,
+  timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+  path,
+  message
 });
 
 // ---------- Baileys lifecycle ----------
 let sock = null;
 let connectionState = { connected: false, lastDisconnect: null };
-let latestQR = null; // store the most recent QR string
+let latestQR = null; // store the most recent QR string from Baileys
 
 async function startBaileys() {
   const authDir = path.join(__dirname, "auth");
@@ -50,7 +52,7 @@ async function startBaileys() {
   sock = makeWASocket({
     version,
     auth: state,
-    printQRInTerminal: true, // also prints in console
+    printQRInTerminal: true, // also prints QR in the server logs
     browser: ["API", "Chrome", "1.0"]
   });
 
@@ -70,7 +72,7 @@ async function startBaileys() {
       console.log("❌ Connection closed:", code);
 
       if (code !== DisconnectReason.loggedOut) {
-        // try to reconnect
+        // attempt to reconnect
         try { await startBaileys(); } catch (e) { console.error("reconnect fail", e); }
       } else {
         console.log("Logged out. Delete ./auth to re-link.");
@@ -91,24 +93,60 @@ app.get("/health", (req, res) => {
   });
 });
 
-// current QR for login (if not connected)
-// returns { qr, dataUrl } where dataUrl is a PNG image (base64) you can embed in <img src="...">
+// --- UPDATED: render QR as an IMAGE page (not JSON) ---
 app.get("/auth/qr", async (req, res) => {
   if (connectionState.connected) {
-    return res.json({ connected: true, qr: null, dataUrl: null });
+    res.send(`
+      <html>
+        <head><title>WhatsApp QR</title></head>
+        <body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif">
+          <h2>✅ WhatsApp is already connected.</h2>
+        </body>
+      </html>
+    `);
+    return;
   }
+
   if (!latestQR) {
-    return res.status(503).json(envelopeError(503, req.path, "QR not generated yet; open console or retry shortly"));
+    res.send(`
+      <html>
+        <head><title>WhatsApp QR</title>
+          <meta http-equiv="refresh" content="5">
+        </head>
+        <body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif">
+          <h2>⏳ QR not generated yet. This page refreshes every 5s…</h2>
+        </body>
+      </html>
+    `);
+    return;
   }
-  const dataUrl = await QRCode.toDataURL(latestQR, { margin: 1, width: 256 });
-  res.json({ connected: false, qr: latestQR, dataUrl });
+
+  try {
+    const dataUrl = await QRCode.toDataURL(latestQR, { margin: 1, width: 320 });
+    res.send(`
+      <html>
+        <head>
+          <title>WhatsApp QR</title>
+          <!-- auto-refresh every 15s because QR expires quickly -->
+          <meta http-equiv="refresh" content="15">
+        </head>
+        <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif">
+          <h2>Scan this QR with WhatsApp → Linked Devices</h2>
+          <img src="${dataUrl}" alt="WhatsApp QR" style="width:320px;height:320px" />
+          <p style="margin-top:10px;color:#666">This page auto-refreshes to keep the QR fresh.</p>
+        </body>
+      </html>
+    `);
+  } catch (err) {
+    res.status(500).send("Error generating QR image");
+  }
 });
 
 // check a single number
 // body: { "number": "+13039003684" }
 app.post("/check", async (req, res) => {
   if (!connectionState.connected) {
-    return res.status(503).json(envelopeError(503, req.path, "WhatsApp not connected; scan QR at /auth/qr"));
+    return res.status(503).json(envelopeError(503, req.path, "WhatsApp not connected; open /auth/qr and scan the code"));
   }
   const raw = req.body?.number;
   const number = normalizeNumber(raw);
@@ -125,11 +163,11 @@ app.post("/check", async (req, res) => {
   }
 });
 
-// batch check many numbers at once
+// batch check many numbers
 // body: { "numbers": ["+13039003684", "+441234567890", ...] }
 app.post("/batch", async (req, res) => {
   if (!connectionState.connected) {
-    return res.status(503).json(envelopeError(503, req.path, "WhatsApp not connected; scan QR at /auth/qr"));
+    return res.status(503).json(envelopeError(503, req.path, "WhatsApp not connected; open /auth/qr and scan the code"));
   }
 
   const arr = Array.isArray(req.body?.numbers) ? req.body.numbers : null;
@@ -137,7 +175,6 @@ app.post("/batch", async (req, res) => {
     return res.status(422).json(envelopeError(422, req.path, "'numbers' must be a non-empty array"));
   }
 
-  // normalize & keep original order
   const indexed = arr.map((raw, i) => ({ raw, i, number: normalizeNumber(raw) }))
                      .filter(x => !!x.number);
 
@@ -154,11 +191,10 @@ app.post("/batch", async (req, res) => {
       })
     ));
 
-    // place back into original order, marking invalid inputs too
+    // place back into original order and mark invalids
     const out = arr.map((raw, i) => {
       const ok = results.find(r => r.idx === i);
       if (ok) return { number: ok.number, existsWhatsapp: ok.existsWhatsapp, statusCode: ok.statusCode, message: ok.message };
-      // invalid number format
       return { number: String(raw), existsWhatsapp: undefined, statusCode: 422, message: "Invalid number format" };
     });
 
@@ -176,4 +212,4 @@ app.use((err, req, res, _next) => {
 
 // start server
 const PORT = process.env.PORT || 8000;
-app.listen(PORT, () => console.log(`HTTP API on :${PORT}`));
+app.listen(PORT, () => console.log(`HTTP API listening on http://0.0.0.0:${PORT}`));
