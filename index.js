@@ -175,5 +175,5 @@ app.use((err, req, res, _next) => {
 });
 
 // start server
-const PORT = 8000;
-app.listen(PORT, () => console.log(`HTTP API listening on http://localhost:${PORT}`));
+const PORT = process.env.PORT || 8000;
+app.listen(PORT, () => console.log(`HTTP API on :${PORT}`));
