@@ -7,7 +7,7 @@ import makeWASocket, {
 import fs from "fs";
 import path from "path";
 
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN; // your Telegram bot token
+const TELEGRAM_TOKEN = "8433791774:AAGag52ZHTy_fpRqadc8CB_K-ckP5HqoSOc"; // your Telegram bot token
 if (!TELEGRAM_TOKEN) throw new Error("Missing TELEGRAM_TOKEN in environment");
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
