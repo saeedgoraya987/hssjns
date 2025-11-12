@@ -1,10 +1,9 @@
-// --- Fix crypto not defined on some hosts ---
 import { webcrypto } from "crypto";
 globalThis.crypto = webcrypto;
 
-// --- Imports ---
 import TelegramBot from "node-telegram-bot-api";
 import * as baileys from "@whiskeysockets/baileys";
+import QRCode from "qrcode";
 import fs from "fs";
 import path from "path";
 
@@ -15,18 +14,15 @@ const {
   DisconnectReason
 } = baileys;
 
-// --- Telegram token ---
 const TELEGRAM_TOKEN = "8433791774:AAGag52ZHTy_fpRqadc8CB_K-ckP5HqoSOc";
-if (!TELEGRAM_TOKEN) throw new Error("Missing TELEGRAM_TOKEN in environment.");
+if (!TELEGRAM_TOKEN) throw new Error("Missing TELEGRAM_TOKEN");
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-// --- Session management ---
-const sessions = {}; // userId -> { sock, connected, pairingCode }
+const sessions = {};
 const getSessionPath = (userId) => path.join("./sessions", String(userId));
 
-// --- WhatsApp session starter ---
-async function startWhatsApp(userId, phoneNumber) {
+async function startWhatsApp(userId) {
   const sessionDir = getSessionPath(userId);
   if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
 
@@ -35,81 +31,70 @@ async function startWhatsApp(userId, phoneNumber) {
 
   const sock = makeWASocket({
     version,
-    printQRInTerminal: false,
-    browser: ["TelegramBot", "Chrome", "1.0"],
-    auth: state
+    printQRInTerminal: true,
+    auth: state,
+    browser: ["TelegramBot", "Chrome", "1.0"]
   });
 
-  sessions[userId] = { sock, connected: false, pairingCode: null };
+  sessions[userId] = { sock, connected: false, qr: null };
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect } = update;
-    const code = lastDisconnect?.error?.output?.statusCode;
+  sock.ev.on("connection.update", async (u) => {
+    const { connection, qr, lastDisconnect } = u;
+
+    if (qr) {
+      const qrPng = await QRCode.toDataURL(qr, { width: 300 });
+      await bot.sendPhoto(userId, qrPng, {
+        caption:
+          "📱 Scan this QR from WhatsApp → *Linked Devices* → *Link a device*",
+        parse_mode: "Markdown"
+      });
+      sessions[userId].qr = qr;
+    }
 
     if (connection === "open") {
       sessions[userId].connected = true;
-      sessions[userId].pairingCode = null;
+      sessions[userId].qr = null;
       bot.sendMessage(userId, "✅ WhatsApp connected successfully!");
     } else if (connection === "close") {
+      const code = lastDisconnect?.error?.output?.statusCode;
       sessions[userId].connected = false;
-      console.log(`❌ [${userId}] Connection closed:`, code);
-
       if (code === DisconnectReason.loggedOut || code === 401) {
-        bot.sendMessage(userId, "⚠️ WhatsApp logged out. Please use /login again.");
+        bot.sendMessage(userId, "⚠️ Logged out. Use /login again.");
         fs.rmSync(sessionDir, { recursive: true, force: true });
         delete sessions[userId];
       } else {
-        bot.sendMessage(userId, "🔁 Connection lost, trying to reconnect...");
-        setTimeout(() => startWhatsApp(userId, phoneNumber).catch(console.error), 4000);
+        bot.sendMessage(userId, "🔁 Connection closed. Reconnecting...");
+        setTimeout(() => startWhatsApp(userId).catch(console.error), 4000);
       }
     }
   });
-
-  // --- Generate pairing code if needed ---
-  if (!sock.authState.creds?.registered) {
-    if (!phoneNumber) throw new Error("Phone number required for pairing.");
-    const code = await sock.requestPairingCode(phoneNumber.replace(/\+/g, ""));
-    sessions[userId].pairingCode = code;
-    bot.sendMessage(
-      userId,
-      `🔗 *Your WhatsApp Pairing Code:* \`${code}\`\n\nOpen WhatsApp → *Linked Devices* → *Link with phone number* → enter this code.`,
-      { parse_mode: "Markdown" }
-    );
-  } else {
-    sessions[userId].connected = true;
-    bot.sendMessage(userId, "✅ Already linked with WhatsApp!");
-  }
-
-  return sessions[userId];
 }
 
-// --- Telegram Commands ---
+// ---------- Telegram Commands ----------
 
 bot.onText(/\/start/, (msg) => {
   const name = msg.from.first_name || "user";
   bot.sendMessage(
     msg.chat.id,
-    `👋 Welcome, ${name}!\nEach Telegram user gets a private WhatsApp session.\n\n` +
-      `Commands:\n` +
-      `/login <phone> – Link WhatsApp (get pairing code)\n` +
-      `/status – Check WhatsApp connection\n` +
-      `/check <number> – Check if number exists on WhatsApp\n` +
-      `/send <number> <text> – Send WhatsApp message\n` +
-      `/logout – Unlink & delete session\n` +
-      `/reset – Force-delete your WhatsApp session folder (no shell needed)`
+    `👋 Welcome, ${name}!
+Each Telegram user gets a private WhatsApp session.
+
+Commands:
+/login – Get QR to link WhatsApp
+/status – Check WhatsApp connection
+/check <number> – Check if number exists
+/send <number> <text> – Send WhatsApp message
+/logout – Unlink & delete session`
   );
 });
 
-// /login <phone>
-bot.onText(/\/login (.+)/, async (msg, match) => {
+// /login
+bot.onText(/\/login/, async (msg) => {
   const userId = msg.chat.id;
-  const phone = match[1].trim();
-
   try {
-    await startWhatsApp(userId, phone);
+    await startWhatsApp(userId);
   } catch (e) {
-    console.error(e);
     bot.sendMessage(userId, "❌ " + e.message);
   }
 });
@@ -118,15 +103,14 @@ bot.onText(/\/login (.+)/, async (msg, match) => {
 bot.onText(/\/status/, (msg) => {
   const userId = msg.chat.id;
   const s = sessions[userId];
-  if (!s)
-    return bot.sendMessage(userId, "ℹ️ No active WhatsApp session. Use /login <phone>");
+  if (!s) return bot.sendMessage(userId, "ℹ️ No session yet. Use /login.");
   bot.sendMessage(
     userId,
-    s.connected ? "✅ WhatsApp connected and active." : "⏳ Not connected yet or reconnecting..."
+    s.connected ? "✅ WhatsApp connected." : "⏳ Waiting for QR scan / reconnecting..."
   );
 });
 
-// /check <number>
+// /check
 bot.onText(/\/check (.+)/, async (msg, match) => {
   const userId = msg.chat.id;
   const s = sessions[userId];
@@ -143,7 +127,7 @@ bot.onText(/\/check (.+)/, async (msg, match) => {
   }
 });
 
-// /send <number> <message>
+// /send
 bot.onText(/\/send ([^\s]+) (.+)/, async (msg, match) => {
   const userId = msg.chat.id;
   const s = sessions[userId];
@@ -164,8 +148,7 @@ bot.onText(/\/send ([^\s]+) (.+)/, async (msg, match) => {
 bot.onText(/\/logout/, async (msg) => {
   const userId = msg.chat.id;
   const s = sessions[userId];
-  if (!s) return bot.sendMessage(userId, "ℹ️ No session to log out.");
-
+  if (!s) return bot.sendMessage(userId, "ℹ️ No active session.");
   try {
     await s.sock.logout();
     fs.rmSync(getSessionPath(userId), { recursive: true, force: true });
@@ -176,25 +159,4 @@ bot.onText(/\/logout/, async (msg) => {
   }
 });
 
-// /reset  →  delete user’s session folder directly
-bot.onText(/\/reset/, async (msg) => {
-  const userId = msg.chat.id;
-  const dir = getSessionPath(userId);
-
-  try {
-    if (fs.existsSync(dir)) {
-      fs.rmSync(dir, { recursive: true, force: true });
-      delete sessions[userId];
-      await bot.sendMessage(
-        userId,
-        "🧹 Session data deleted. Now run /login +<your phone> to generate a new pairing code."
-      );
-    } else {
-      await bot.sendMessage(userId, "ℹ️ No saved session folder found for you.");
-    }
-  } catch (err) {
-    await bot.sendMessage(userId, "❌ Error clearing session: " + err.message);
-  }
-});
-
-console.log("🤖 Telegram WhatsApp bot running...");
+console.log("🤖 Telegram WhatsApp bot (QR login) running...");
