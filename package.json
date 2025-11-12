@@ -2,10 +2,10 @@
   "name": "telegram-whatsapp-bot",
   "version": "1.0.0",
   "description": "A Telegram bot that gives each user their own WhatsApp session using Baileys pairing codes.",
-  "main": "bot.js",
+  "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.5",
