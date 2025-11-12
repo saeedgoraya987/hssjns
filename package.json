@@ -1,7 +1,7 @@
 {
   "name": "telegram-whatsapp-bot",
-  "version": "1.0.0",
-  "description": "A Telegram bot that gives each user their own WhatsApp session using Baileys pairing codes.",
+  "version": "1.1.0",
+  "description": "Telegram bot with per-user WhatsApp sessions using QR login.",
   "main": "index.js",
   "type": "module",
   "scripts": {
@@ -9,18 +9,10 @@
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.5",
-    "node-telegram-bot-api": "^0.64.0"
+    "node-telegram-bot-api": "^0.64.0",
+    "qrcode": "^1.5.3"
   },
   "engines": {
     "node": ">=18"
-  },
-  "keywords": [
-    "telegram-bot",
-    "whatsapp",
-    "baileys",
-    "pairing-code",
-    "multi-session"
-  ],
-  "author": "Your Name",
-  "license": "MIT"
+  }
 }
