@@ -1,4 +1,4 @@
-// --- Fix crypto not defined ---
+// --- Fix crypto not defined on some hosts ---
 import { webcrypto } from "crypto";
 globalThis.crypto = webcrypto;
 
@@ -66,7 +66,7 @@ async function startWhatsApp(userId, phoneNumber) {
     }
   });
 
-  // --- generate pairing code if needed ---
+  // --- Generate pairing code if needed ---
   if (!sock.authState.creds?.registered) {
     if (!phoneNumber) throw new Error("Phone number required for pairing.");
     const code = await sock.requestPairingCode(phoneNumber.replace(/\+/g, ""));
@@ -91,12 +91,13 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
     `👋 Welcome, ${name}!\nEach Telegram user gets a private WhatsApp session.\n\n` +
-    `Commands:\n` +
-    `/login <phone> – Link WhatsApp (get pairing code)\n` +
-    `/status – Check WhatsApp connection\n` +
-    `/check <number> – Check if number exists on WhatsApp\n` +
-    `/send <number> <text> – Send WhatsApp message\n` +
-    `/logout – Unlink & delete session`
+      `Commands:\n` +
+      `/login <phone> – Link WhatsApp (get pairing code)\n` +
+      `/status – Check WhatsApp connection\n` +
+      `/check <number> – Check if number exists on WhatsApp\n` +
+      `/send <number> <text> – Send WhatsApp message\n` +
+      `/logout – Unlink & delete session\n` +
+      `/reset – Force-delete your WhatsApp session folder (no shell needed)`
   );
 });
 
@@ -117,7 +118,8 @@ bot.onText(/\/login (.+)/, async (msg, match) => {
 bot.onText(/\/status/, (msg) => {
   const userId = msg.chat.id;
   const s = sessions[userId];
-  if (!s) return bot.sendMessage(userId, "ℹ️ No active WhatsApp session. Use /login <phone>");
+  if (!s)
+    return bot.sendMessage(userId, "ℹ️ No active WhatsApp session. Use /login <phone>");
   bot.sendMessage(
     userId,
     s.connected ? "✅ WhatsApp connected and active." : "⏳ Not connected yet or reconnecting..."
@@ -171,6 +173,27 @@ bot.onText(/\/logout/, async (msg) => {
     bot.sendMessage(userId, "👋 Logged out and session deleted.");
   } catch (e) {
     bot.sendMessage(userId, "⚠️ Logout error: " + e.message);
+  }
+});
+
+// /reset  →  delete user’s session folder directly
+bot.onText(/\/reset/, async (msg) => {
+  const userId = msg.chat.id;
+  const dir = getSessionPath(userId);
+
+  try {
+    if (fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      delete sessions[userId];
+      await bot.sendMessage(
+        userId,
+        "🧹 Session data deleted. Now run /login +<your phone> to generate a new pairing code."
+      );
+    } else {
+      await bot.sendMessage(userId, "ℹ️ No saved session folder found for you.");
+    }
+  } catch (err) {
+    await bot.sendMessage(userId, "❌ Error clearing session: " + err.message);
   }
 });
 
