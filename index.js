@@ -1,9 +1,10 @@
-import TelegramBot from "node-telegram-bot-api";
-import makeWASocket, {
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  DisconnectReason
-} from "@whiskeysockets/baileys";
+import * as baileys from "@whiskeysockets/baileys";
+const { 
+  makeWASocket, 
+  useMultiFileAuthState, 
+  fetchLatestBaileysVersion, 
+  DisconnectReason 
+} = baileys;
 import fs from "fs";
 import path from "path";
 
