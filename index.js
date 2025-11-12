@@ -1,3 +1,8 @@
+// --- Fix for crypto not defined ---
+import { webcrypto } from "crypto";
+globalThis.crypto = webcrypto;
+
+// --- Imports ---
 import TelegramBot from "node-telegram-bot-api";
 import * as baileys from "@whiskeysockets/baileys";
 import fs from "fs";
@@ -10,17 +15,17 @@ const {
   DisconnectReason
 } = baileys;
 
+// --- Telegram bot token ---
 const TELEGRAM_TOKEN = "8433791774:AAGag52ZHTy_fpRqadc8CB_K-ckP5HqoSOc";
-if (!TELEGRAM_TOKEN) throw new Error("Missing TELEGRAM_TOKEN environment variable.");
+if (!TELEGRAM_TOKEN) throw new Error("Missing TELEGRAM_TOKEN in environment.");
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-// -------- store WhatsApp sessions --------
+// --- WhatsApp session storage ---
 const sessions = {}; // userId → { sock, pairingCode, connected }
-
 const getSessionPath = (userId) => path.join("./sessions", String(userId));
 
-// -------- WhatsApp session handler --------
+// --- WhatsApp Session Manager ---
 async function startWhatsApp(userId, phoneNumber) {
   const sessionDir = getSessionPath(userId);
   if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
@@ -55,7 +60,7 @@ async function startWhatsApp(userId, phoneNumber) {
     }
   });
 
-  // request pairing code if not already linked
+  // Request pairing code if not already linked
   if (!sock.authState.creds?.registered) {
     if (!phoneNumber) throw new Error("Phone number required for pairing code session.");
     const code = await sock.requestPairingCode(phoneNumber.replace(/\+/g, ""));
@@ -73,7 +78,7 @@ async function startWhatsApp(userId, phoneNumber) {
   return sessions[userId];
 }
 
-// -------- Telegram Commands --------
+// --- Telegram Commands ---
 
 // /start
 bot.onText(/\/start/, (msg) => {
@@ -81,12 +86,12 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
     `👋 Welcome, ${name}!
-Each Telegram user gets a private WhatsApp session.
+Each Telegram user gets their own private WhatsApp session.
 
 Commands:
-/login <phone> — Link your WhatsApp (get pairing code)
-/status — Check if you're connected
-/check <number> — Check if a number has WhatsApp
+/login <phone> — Get WhatsApp pairing code
+/status — Check WhatsApp connection
+/check <number> — Check if number exists on WhatsApp
 /send <number> <text> — Send WhatsApp message
 /logout — Unlink and delete your WhatsApp session`
   );
