@@ -1,17 +1,26 @@
 {
-  "name": "baileys-whatsapp-api",
+  "name": "telegram-whatsapp-bot",
   "version": "1.0.0",
+  "description": "A Telegram bot that gives each user their own WhatsApp session using Baileys pairing codes.",
+  "main": "bot.js",
   "type": "module",
-  "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js"
+    "start": "node bot.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.8",
-    "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "p-limit": "^5.0.0",
-    "qrcode": "^1.5.4"
-  }
+    "@whiskeysockets/baileys": "^6.7.5",
+    "node-telegram-bot-api": "^0.64.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "telegram-bot",
+    "whatsapp",
+    "baileys",
+    "pairing-code",
+    "multi-session"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
 }
