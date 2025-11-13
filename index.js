@@ -2,12 +2,14 @@ import express from "express";
 import cors from "cors";
 import QRCode from "qrcode";
 
-import {
-    default as makeWASocket,
-    useMultiFileAuthState,
-    fetchLatestBaileysVersion,
-    DisconnectReason
-} from "@whiskeysockets/baileys";
+import baileys from "@whiskeysockets/baileys";
+
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  DisconnectReason
+} = baileys;
 
 import fs from "fs";
 import path from "path";
