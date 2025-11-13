@@ -95,11 +95,14 @@ async function createSession(userId) {
   let connected = false;
 
   const sock = makeWASocket({
-    auth: state,
-    version,
-    printQRInTerminal: false,
-    browser: ["WPChecker", "Chrome", "1.0"]
-  });
+  auth: state,
+  version,
+  printQRInTerminal: false,
+  browser: ["WPChecker", "Chrome", "1.0"],
+  mobile: false,
+  syncFullHistory: false,
+  connectTimeoutMs: 30_000
+});
 
   // Save session skeleton early so event handlers can refer to it
   sessions[userId] = {
