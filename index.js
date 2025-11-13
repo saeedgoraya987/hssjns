@@ -28,7 +28,7 @@ app.use(cors());
 app.use(express.json());
 
 const TG_TOKEN = "8433791774:AAGag52ZHTy_fpRqadc8CB_K-ckP5HqoSOc";  // CHANGE THIS
-const SERVER_URL = "https://wpchecker.up.railway.app/"; // CHANGE THIS
+const SERVER_URL = "https://wpchecker.up.railway.app"; // CHANGE THIS
 
 const bot = new TelegramBot(TG_TOKEN, { polling: true });
 
