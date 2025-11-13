@@ -132,6 +132,8 @@ app.get("/qr/:userId", async (req, res) => {
 <html>
 <head>
 <title>WhatsApp Connected</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 body {
    margin:0; padding:0;
@@ -166,6 +168,8 @@ p { opacity:0.7; }
 <html>
 <head>
 <title>Loading QR...</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="3">
 <style>
 body {
@@ -194,6 +198,8 @@ body {
 <html>
 <head>
 <title>Scan WhatsApp QR</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="12">
 <style>
 body {
