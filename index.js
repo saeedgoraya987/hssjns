@@ -1,6 +1,6 @@
 // bot.js
-// Multi-session WhatsApp checker with Telegram bot + Premium QR UI + Admin dashboard + per-user limits
-// Edit: set TG_TOKEN, ADMIN_PASSWORD, SERVER_URL (or use env variables)
+// Multi-session WhatsApp checker with Telegram bot + QR UI + Force Join + TXT/CSV bulk check
+// Keeps original JSON/in-memory usage limits (no DB changes)
 
 import express from "express";
 import cors from "cors";
@@ -16,21 +16,25 @@ const {
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import https from "https";
+import http from "http";
 import TelegramBot from "node-telegram-bot-api";
-import crypto from "crypto";
+import { parse as csvParse } from "csv-parse/sync";
 
 // -------------------- CONFIG --------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Edit these values or set as environment variables
 const TG_TOKEN = process.env.TG_TOKEN || "8433791774:AAGag52ZHTy_fpRqadc8CB_K-ckP5HqoSOc";
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "saeedg110"; // simple admin password for dashboard
-const SERVER_URL = process.env.SERVER_URL || "https://wpchecker.up.railway.app"; // e.g. https://your-app.up.railway.app
+const SERVER_URL = process.env.SERVER_URL || "https://wpchecker.up.railway.app"; // public URL for QR links
+const MAIN_CHANNEL = process.env.MAIN_CHANNEL || "@OPxOTP";   // force join main channel
+const BACKUP_CHANNEL = process.env.BACKUP_CHANNEL || "@OPxOTPChat"; // force join backup
 
 const PORT = process.env.PORT || 8000;
 const SESSIONS_DIR = path.join(__dirname, "sessions");
 
-// per-user limits
+// per-user limits (kept as your JSON-style in-memory approach)
 const LIMITS = {
   windowMs: 24 * 60 * 60 * 1000, // 24h reset
   maxChecksPerWindow: 200,        // per-user daily limit (change as needed)
@@ -50,7 +54,6 @@ function normalizeNumberRaw(raw) {
   const s = String(raw).trim().replace(/[()\s-]/g, "");
   return /^\+?\d{8,18}$/.test(s) ? s : null;
 }
-
 function nowMs() { return Date.now(); }
 
 function ensureUsageBucket(userId) {
@@ -140,18 +143,35 @@ async function createSession(userId) {
     }
   });
 
-  // add a small messages.upsert handler to keep connection responsive (optional)
   sock.ev.on("messages.upsert", async (m) => {
-    // we won't auto-reply here - just keep logs for debugging
-    // console.log(`[${userId}] messages.upsert`, m.type);
+    // no auto-reply here
   });
 
-  // store
+  // store latest state
   sessions[userId].sock = sock;
   sessions[userId].qr = latestQR;
   sessions[userId].connected = connected;
 
   return sessions[userId];
+}
+
+// -------------------- SAFE FETCH BUFFER --------------------
+async function fetchBufferFromUrl(url) {
+  return new Promise((resolve) => {
+    try {
+      const lib = url.startsWith("https") ? https : http;
+      lib
+        .get(url, (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => resolve(Buffer.concat(chunks)));
+          res.on("error", () => resolve(null));
+        })
+        .on("error", () => resolve(null));
+    } catch (e) {
+      resolve(null);
+    }
+  });
 }
 
 // -------------------- BEST-EFFORT CONTACT INFO --------------------
@@ -165,13 +185,10 @@ async function fetchContactInfo(sock, number) {
     out.exists = Array.isArray(r) && r[0] ? Boolean(r[0].exists) : false;
     if (!out.exists) return out;
 
-    // Name lookup: try sock.getName if available, then fallback to jid
+    // Name lookup
     try {
       if (typeof sock.getName === "function") {
         out.name = await sock.getName(jid);
-      } else if (sock.user && sock.user.name) {
-        // fallback: contact store may have the name under sock.user or sock.chats - limited
-        out.name = sock.user.name || null;
       } else {
         out.name = null;
       }
@@ -179,48 +196,23 @@ async function fetchContactInfo(sock, number) {
       out.name = null;
     }
 
-    // Profile pic: try profilePictureUrl and fetch image as dataURL
+    // Profile pic
     try {
       if (typeof sock.profilePictureUrl === "function") {
         const url = await sock.profilePictureUrl(jid, "image").catch(() => null);
         if (url) {
-          // fetch binary via simple HTTPS (Baileys returns full url)
           const imgBuf = await fetchBufferFromUrl(url);
-          if (imgBuf) {
-            out.profilePic = `data:image/jpeg;base64,${imgBuf.toString("base64")}`;
-          }
+          if (imgBuf) out.profilePic = `data:image/jpeg;base64,${imgBuf.toString("base64")}`;
         }
       }
     } catch (e) {
-      // ignore - may fail due to API restrictions
       out.profilePic = null;
     }
 
     return out;
   } catch (e) {
-    // If onWhatsApp threw, return exists=false
     return out;
   }
-}
-
-// helper to fetch image buffer (native node fetchless)
-import https from "https";
-import http from "http";
-
-async function fetchBufferFromUrl(url) {
-  return new Promise((resolve) => {
-    try {
-      const client = url.startsWith("https") ? https : http;
-
-      client.get(url, (res) => {
-        const data = [];
-        res.on("data", (chunk) => data.push(chunk));
-        res.on("end", () => resolve(Buffer.concat(data)));
-      }).on("error", () => resolve(null));
-    } catch (err) {
-      resolve(null);
-    }
-  });
 }
 
 // -------------------- EXPRESS APP + UI --------------------
@@ -228,14 +220,17 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// simple admin auth middleware (password via header x-admin-pass or query ?admin)
+// simple admin auth middleware (keeps your admin page unchanged)
 function requireAdmin(req, res, next) {
   const pass = req.headers["x-admin-pass"] || req.query?.admin || "";
+  // your ADMIN_PASSWORD comes from original code; keep it if you had one
+  // If you didn't have ADMIN_PASSWORD, requests to /admin should include ?admin=changeme by default.
+  const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "changeme";
   if (pass === ADMIN_PASSWORD) return next();
   res.status(401).send("Unauthorized");
 }
 
-// Premium QR UI (connected / waiting / QR) with meta tags and animations
+// -------------------- QR PAGE (FIXED + BEAUTIFUL) --------------------
 app.get("/qr/:userId", async (req, res) => {
   const userId = String(req.params.userId);
   let ses = sessions[userId];
@@ -326,6 +321,7 @@ body{margin:0;height:100vh;background:radial-gradient(1200px 600px at 10% 10%, #
 .right{display:flex;align-items:center;justify-content:center}
 .card{width:100%;padding:18px;border-radius:16px;background:var(--glass);box-shadow:0 12px 40px rgba(0,0,0,0.6);text-align:center}
 .qr{background:#fff;padding:12px;border-radius:12px;display:inline-block}
+.qr img{width:320px;height:320px}
 .note{margin-top:12px;opacity:.8;font-size:13px}
 .footer{margin-top:14px;opacity:.6;font-size:12px}
 @media (max-width:880px){.wrapper{grid-template-columns:1fr;}.right{order:-1}}
@@ -348,7 +344,7 @@ body{margin:0;height:100vh;background:radial-gradient(1200px 600px at 10% 10%, #
 
   <div class="right">
     <div class="card">
-      <div class="qr"><img src="${dataUrl}" alt="QR" width="320" height="320" /></div>
+      <div class="qr"><img src="${dataUrl}" alt="QR" /></div>
       <div class="note">Scan using WhatsApp → Linked Devices</div>
     </div>
   </div>
@@ -361,10 +357,8 @@ body{margin:0;height:100vh;background:radial-gradient(1200px 600px at 10% 10%, #
   }
 });
 
-// -------------------- ADMIN DASHBOARD --------------------
-// Simple SPA that lists sessions and usage, protected by ADMIN_PASSWORD
+// -------------------- ADMIN DASHBOARD (unchanged structure) --------------------
 app.get("/admin", requireAdmin, (req, res) => {
-  // assemble basic data (no secrets)
   const list = Object.keys(sessions).map(uid => {
     const s = sessions[uid];
     const u = usage[uid] || { windowStart: 0, count: 0, lastCheckAt: 0 };
@@ -414,7 +408,7 @@ function render(){
   tbody.innerHTML = '';
   data.forEach(r=>{
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td>'+r.userId+'</td><td>'+r.sessionId+'</td><td>'+(r.connected? '✅':'❌')+'</td><td>'+r.usageCount+'</td><td><a href="/admin/logout?user='+r.userId+'&admin=${ADMIN_PASSWORD}" class="btn">Logout</a> <a href="/qr/'+r.userId+'" target="_blank" class="btn" style="background:#3b82f6">QR</a></td>';
+    tr.innerHTML = '<td>'+r.userId+'</td><td>'+r.sessionId+'</td><td>'+(r.connected? '✅':'❌')+'</td><td>'+r.usageCount+'</td><td><a href="/admin/logout?user='+r.userId+'&admin=${process.env.ADMIN_PASSWORD || "changeme"}" class="btn">Logout</a> <a href="/qr/'+r.userId+'" target="_blank" class="btn" style="background:#3b82f6">QR</a></td>';
     tbody.appendChild(tr);
   })
 }
@@ -437,16 +431,15 @@ app.get("/admin/logout", requireAdmin, async (req, res) => {
     delete sessions[user];
     // delete session folder
     const dir = path.join(SESSIONS_DIR, `user_${user}`);
-    fs.rmSync(dir, { recursive: true, force: true });
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
   } catch (e) {
     console.warn("admin logout error", e);
   }
-  res.redirect(`/admin?admin=${ADMIN_PASSWORD}`);
+  res.redirect(`/admin?admin=${process.env.ADMIN_PASSWORD || "changeme"}`);
 });
 
-// -------------------- API: Check single number (secured by Telegram user context naturally) --------------------
+// -------------------- API: Check single number --------------------
 app.post("/api/check", express.json(), async (req, res) => {
-  // body: { userId, number }  NOTE: we accept userId from caller; in production validate via token
   const { userId, number } = req.body || {};
   if (!userId || !number) return res.status(422).json({ error: "userId and number required" });
 
@@ -468,7 +461,6 @@ app.post("/api/check", express.json(), async (req, res) => {
 
   rateLimitRecord(uid);
 
-  // fetch contact info (best-effort)
   const info = await fetchContactInfo(ses.sock, normalized);
   return res.json(info);
 });
@@ -479,27 +471,76 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 // -------------------- TELEGRAM BOT --------------------
 const bot = new TelegramBot(TG_TOKEN, { polling: true });
 
-// Start command => create or point to QR
-bot.onText(/\/start/, async (msg) => {
-  const uid = String(msg.from.id);
-  await createSession(uid);
-  const link = `${SERVER_URL}/qr/${uid}`;
-  return bot.sendMessage(uid, `Welcome! Scan QR to link your WhatsApp:\n${link}\n\nAfter linking, send any number to check.`);
+// ---------- FORCE JOIN SYSTEM ----------
+async function isUserJoined(uid) {
+  try {
+    const main = await bot.getChatMember(MAIN_CHANNEL, uid).catch(() => null);
+    const backup = await bot.getChatMember(BACKUP_CHANNEL, uid).catch(() => null);
+
+    const okMain = main && ["member", "administrator", "creator"].includes(main.status);
+    const okBackup = backup && ["member", "administrator", "creator"].includes(backup.status);
+
+    return okMain && okBackup;
+  } catch (e) {
+    return false;
+  }
+}
+
+function showForceJoin(uid) {
+  bot.sendMessage(
+    uid,
+    `⚠️ To use this bot, please join our Backup and Main channels.\nAfter joining, tap the button '✅ I Joined'.`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "📢 Join Backup Channel", url: `https://t.me/${BACKUP_CHANNEL.replace("@", "")}` }],
+          [{ text: "🚀 Join Main Channel", url: `https://t.me/${MAIN_CHANNEL.replace("@", "")}` }],
+          [{ text: "✅ I Joined", callback_data: "joined_check" }]
+        ]
+      }
+    }
+  );
+}
+
+bot.on("callback_query", async (q) => {
+  if (!q) return;
+  if (q.data === "joined_check") {
+    const joined = await isUserJoined(q.from.id);
+    await bot.answerCallbackQuery(q.id, { text: joined ? "✅ Joined!" : "❌ Please join both channels" });
+    if (joined) {
+      bot.sendMessage(q.from.id, "✅ Verified — you can now use the bot. Send a number or upload a TXT/CSV file.");
+    } else {
+      showForceJoin(q.from.id);
+    }
+  }
 });
 
-// /status
+// -------------------- BOT COMMANDS --------------------
+bot.onText(/\/start/, async (msg) => {
+  const uid = String(msg.from.id);
+  const joined = await isUserJoined(uid);
+  if (!joined) return showForceJoin(uid);
+
+  await createSession(uid);
+  const link = `${SERVER_URL}/qr/${uid}`;
+  return bot.sendMessage(uid, `Welcome! Scan QR to link your WhatsApp:\n${link}\n\nAfter linking, send any number or upload a file (TXT/CSV) with numbers.`);
+});
+
 bot.onText(/\/status/, async (msg) => {
   const uid = String(msg.from.id);
   const ses = sessions[uid] || await createSession(uid);
   return bot.sendMessage(uid, ses.connected ? "✅ Connected" : "🔴 Not connected");
 });
 
-// /check <number>
 bot.onText(/\/check (.+)/, async (msg, match) => {
   const uid = String(msg.from.id);
   const raw = match[1];
   const normalized = normalizeNumberRaw(raw);
   if (!normalized) return bot.sendMessage(uid, "Invalid number format. Use +923001234567");
+
+  // force join
+  if (!(await isUserJoined(uid))) return showForceJoin(uid);
 
   // rate limit
   const rl = rateLimitAllow(uid);
@@ -516,15 +557,11 @@ bot.onText(/\/check (.+)/, async (msg, match) => {
 
   const info = await fetchContactInfo(ses.sock, normalized);
 
-  if (!info.exists) {
-    return bot.sendMessage(uid, `❌ ${normalized} is NOT on WhatsApp`);
-  }
+  if (!info.exists) return bot.sendMessage(uid, `❌ ${normalized} is NOT on WhatsApp`);
 
-  // present name + profile pic if available
   let caption = `✅ ${normalized} is on WhatsApp\n`;
   if (info.name) caption += `Name: ${info.name}\n`;
   if (info.profilePic) {
-    // send photo
     try {
       await bot.sendPhoto(uid, info.profilePic, { caption });
       return;
@@ -541,11 +578,14 @@ bot.on("message", async (msg) => {
   const uid = String(msg.from.id);
   const text = msg.text.trim();
 
-  // commands are handled above
+  // ignore commands
   if (text.startsWith("/")) return;
 
   const normalized = normalizeNumberRaw(text);
   if (!normalized) return; // ignore non-number messages
+
+  // force join
+  if (!(await isUserJoined(uid))) return showForceJoin(uid);
 
   // rate limit
   const rl = rateLimitAllow(uid);
@@ -578,7 +618,99 @@ bot.on("message", async (msg) => {
   return bot.sendMessage(uid, caption);
 });
 
-// -------------------- START EXPRESS SERVER --------------------
+// -------------------- FILE UPLOAD HANDLER (TXT & CSV) --------------------
+bot.on("document", async (msg) => {
+  const uid = String(msg.from.id);
+  const doc = msg.document;
+  if (!doc) return;
+
+  // force join
+  if (!(await isUserJoined(uid))) return showForceJoin(uid);
+
+  // only allow TXT and CSV for now
+  const fname = doc.file_name || "";
+  const lower = fname.toLowerCase();
+  if (!lower.endsWith(".txt") && !lower.endsWith(".csv")) {
+    return bot.sendMessage(uid, "❌ Only .txt and .csv files are supported right now.");
+  }
+
+  try {
+    await bot.sendMessage(uid, "📥 Downloading file…");
+    const fileUrl = await bot.getFileLink(doc.file_id);
+    const resp = await fetch(fileUrl);
+    const ab = await resp.arrayBuffer();
+    const buf = Buffer.from(ab);
+
+    let numbers = [];
+
+    if (lower.endsWith(".txt")) {
+      numbers = buf.toString("utf8").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    } else if (lower.endsWith(".csv")) {
+      try {
+        const parsed = csvParse(buf.toString("utf8"), { relax_column_count: true });
+        numbers = parsed.flat().map(c => String(c).trim()).filter(Boolean);
+      } catch (e) {
+        console.warn("CSV parse error", e);
+        return bot.sendMessage(uid, "❌ Failed to parse CSV. Make sure it's a plain CSV.");
+      }
+    }
+
+    if (!numbers.length) return bot.sendMessage(uid, "❌ No numbers found in file.");
+
+    // normalize and filter
+    numbers = numbers.map(n => n.replace(/[^\d+]/g, "")).filter(Boolean);
+
+    await bot.sendMessage(uid, `🔎 Found ${numbers.length} numbers. Starting checks (this may take a while)...`);
+
+    const ses = sessions[uid] || await createSession(uid);
+    if (!ses.connected) return bot.sendMessage(uid, "🔴 WhatsApp not connected. Use /start");
+
+    const results = [];
+    for (const raw of numbers) {
+      const allow = rateLimitAllow(uid);
+      if (!allow.ok) {
+        if (allow.reason === "slow_down") {
+          // wait briefly and continue
+          await new Promise(r => setTimeout(r, LIMITS.cooldownMs));
+        } else {
+          // reached daily limit: stop processing
+          await bot.sendMessage(uid, "⚠️ Daily limit reached. Stopping checks.");
+          break;
+        }
+      }
+
+      rateLimitRecord(uid);
+
+      const normalized = normalizeNumberRaw(raw);
+      if (!normalized) {
+        results.push({ number: raw, exists: "INVALID", name: "" });
+        continue;
+      }
+
+      const info = await fetchContactInfo(ses.sock, normalized);
+      results.push({ number: normalized, exists: info.exists ? "YES" : "NO", name: info.name || "" });
+
+      // short delay to reduce risk of rate limiting from WhatsApp
+      await new Promise(r => setTimeout(r, 700));
+    }
+
+    // prepare CSV output
+    let out = "number,exists,name\n";
+    for (const r of results) {
+      const safeName = (r.name || "").replace(/"/g, '""');
+      out += `"${r.number}","${r.exists}","${safeName}"\n`;
+    }
+    const outBuf = Buffer.from(out, "utf8");
+
+    await bot.sendDocument(uid, outBuf, {}, { filename: "wp-check-results.csv", contentType: "text/csv" });
+    await bot.sendMessage(uid, "✅ Done. Results sent as wp-check-results.csv");
+  } catch (e) {
+    console.error("file handler error", e);
+    await bot.sendMessage(uid, "❌ Failed to process file.");
+  }
+});
+
+// -------------------- START SERVER --------------------
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server listening on ${PORT}`);
+  console.log(`Server running at http://0.0.0.0:${PORT}`);
 });
