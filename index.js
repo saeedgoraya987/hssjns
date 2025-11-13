@@ -1,10 +1,12 @@
 import express from "express";
 import cors from "cors";
 import QRCode from "qrcode";
-import makeWASocket, {
-    DisconnectReason,
+
+import {
+    default as makeWASocket,
+    useMultiFileAuthState,
     fetchLatestBaileysVersion,
-    useMultiFileAuthState
+    DisconnectReason
 } from "@whiskeysockets/baileys";
 
 import fs from "fs";
@@ -14,7 +16,7 @@ import { fileURLToPath } from "url";
 import TelegramBot from "node-telegram-bot-api";
 
 // -----------------------------
-// Basic Setup
+// BASICS
 // -----------------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,41 +25,42 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const TG_TOKEN = "8433791774:AAGag52ZHTy_fpRqadc8CB_K-ckP5HqoSOc";
+const TG_TOKEN = "8433791774:AAGag52ZHTy_fpRqadc8CB_K-ckP5HqoSOc";  // CHANGE THIS
+const SERVER_URL = "https://wpchecker.up.railway.app/"; // CHANGE THIS
+
 const bot = new TelegramBot(TG_TOKEN, { polling: true });
 
-const sessions = {};   // { telegramUserId: { sock, qr, connected, sessionId } }
+const sessions = {}; // each Telegram user --> own WhatsApp session
 
 // -----------------------------
 // HELPERS
 // -----------------------------
-
 function normalize(num) {
     if (!num) return null;
-    let s = num.replace(/\s+/g, "").replace(/-/g, "");
-    return /^\+?\d{8,18}$/.test(s) ? s : null;
+    num = num.replace(/\s+/g, "").replace(/-/g, "");
+    return /^\+?\d{8,18}$/.test(num) ? num : null;
 }
 
 async function isWhatsapp(sock, number) {
     try {
         const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
         const r = await sock.onWhatsApp(jid);
-        return r[0]?.exists ? true : false;
-    } catch {
+        return r[0]?.exists || false;
+    } catch (e) {
         return false;
     }
 }
 
 // -----------------------------
-// CREATE NEW SESSION FOR USER
+// SESSION CREATION
 // -----------------------------
 async function createSession(userId) {
-    const sessionId = "user_" + userId;
+    const sessionId = `user_${userId}`;
+    const sessionDir = path.join(__dirname, "sessions", sessionId);
 
-    const folder = path.join(__dirname, "sessions", sessionId);
-    if (!fs.existsSync(folder)) fs.mkdirSync(folder, { recursive: true });
+    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
 
-    const { state, saveCreds } = await useMultiFileAuthState(folder);
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
 
     let latestQR = null;
@@ -72,33 +75,48 @@ async function createSession(userId) {
 
     sock.ev.on("creds.update", saveCreds);
 
-    sock.ev.on("connection.update", (u) => {
+    sock.ev.on("connection.update", async (u) => {
         const { connection, qr, lastDisconnect } = u;
 
-        if (qr) latestQR = qr;
+        if (qr) {
+            latestQR = qr;
+            sessions[userId].qr = qr;
+        }
 
         if (connection === "open") {
             connected = true;
-            latestQR = null;
+            sessions[userId].connected = true;
+            sessions[userId].qr = null;
+            console.log(`User ${userId} connected to WhatsApp.`);
         }
 
         if (connection === "close") {
             const code = lastDisconnect?.error?.output?.statusCode;
             connected = false;
+            sessions[userId].connected = false;
+
+            console.log(`User ${userId} disconnected:`, code);
 
             if (code !== DisconnectReason.loggedOut) {
+                console.log("Reconnecting...");
+                await new Promise(r => setTimeout(r, 2000));
                 createSession(userId);
             }
         }
     });
 
-    sessions[userId] = { sock, qr: latestQR, connected, sessionId };
+    sessions[userId] = {
+        sock,
+        qr: latestQR,
+        connected,
+        sessionId
+    };
 
     return sessions[userId];
 }
 
 // -----------------------------
-// EXPRESS: QR PAGE PER USER
+// QR PAGE FOR USER
 // -----------------------------
 app.get("/qr/:userId", async (req, res) => {
     const userId = req.params.userId;
@@ -108,18 +126,17 @@ app.get("/qr/:userId", async (req, res) => {
 
     if (ses.connected) {
         return res.send(`
-            <html><body style="font-family:sans-serif;text-align:center;padding-top:100px">
-                <h2>✅ Connected to WhatsApp</h2>
-                <p>User ID: ${userId}</p>
+            <html><body style="font-family:sans-serif;text-align:center;padding-top:50px">
+            <h2>✅ WhatsApp Connected</h2>
             </body></html>
         `);
     }
 
     if (!ses.qr) {
         return res.send(`
-            <html><meta http-equiv="refresh" content="4">
-            <body style="font-family:sans-serif;text-align:center;padding-top:100px">
-                <h2>⏳ Waiting for QR…</h2>
+            <html><meta http-equiv="refresh" content="5">
+            <body style="text-align:center;font-family:sans-serif;padding-top:50px">
+            <h2>⏳ Waiting for QR…</h2>
             </body></html>
         `);
     }
@@ -143,21 +160,15 @@ bot.onText(/\/start/, async (msg) => {
 
     if (!sessions[uid]) await createSession(uid);
 
-    const qrLink = `http://YOUR_SERVER_IP:8000/qr/${uid}`;
+    const qrLink = `${SERVER_URL}/qr/${uid}`;
 
     bot.sendMessage(
         uid,
-        "👋 *Welcome!*\n\n" +
-        "Each user has their *own WhatsApp session*.\n" +
-        "Scan your QR to login:\n\n" +
-        `🔗 *Your QR:* ${qrLink}\n\n` +
-        "After login, send any number to check WhatsApp registration.\n\n" +
-        "*Example:*\n`+923001234567`",
+        `👋 *Welcome!*\n\nScan your WhatsApp QR here:\n${qrLink}\n\nAfter login, send any number.\nExample:\n\`+923001234567\``,
         { parse_mode: "Markdown" }
     );
 });
 
-// STATUS
 bot.onText(/\/status/, async (msg) => {
     const uid = msg.from.id;
 
@@ -165,26 +176,25 @@ bot.onText(/\/status/, async (msg) => {
     if (!ses) ses = await createSession(uid);
 
     if (ses.connected)
-        bot.sendMessage(uid, "🟢 *WhatsApp Connected*", { parse_mode: "Markdown" });
+        bot.sendMessage(uid, "🟢 *WhatsApp CONNECTED*", { parse_mode: "Markdown" });
     else
-        bot.sendMessage(uid, "🔴 *Not Connected*\nUse /start to scan QR", {
-            parse_mode: "Markdown",
+        bot.sendMessage(uid, "🔴 *WhatsApp NOT connected*\nUse /start", {
+            parse_mode: "Markdown"
         });
 });
 
-// CHECK COMMAND
 bot.onText(/\/check (.+)/, async (msg, match) => {
     const uid = msg.from.id;
-    let number = match[1].trim();
+    let number = normalize(match[1].trim());
 
-    number = normalize(number);
-    if (!number) return bot.sendMessage(uid, "❌ Invalid number.");
+    if (!number)
+        return bot.sendMessage(uid, "❌ Invalid number.");
 
     let ses = sessions[uid];
     if (!ses) ses = await createSession(uid);
 
     if (!ses.connected)
-        return bot.sendMessage(uid, "❌ Not connected. Use /start");
+        return bot.sendMessage(uid, "❌ WhatsApp not connected. Use /start");
 
     bot.sendMessage(uid, "⏳ Checking WhatsApp…");
 
@@ -196,7 +206,7 @@ bot.onText(/\/check (.+)/, async (msg, match) => {
         bot.sendMessage(uid, `❌ *${number} is NOT on WhatsApp*`, { parse_mode: "Markdown" });
 });
 
-// AUTO CHECK — ANY MESSAGE
+// Auto-check numbers
 bot.on("message", async (msg) => {
     const uid = msg.from.id;
     const text = msg.text?.trim();
@@ -204,13 +214,13 @@ bot.on("message", async (msg) => {
     if (!text || text.startsWith("/")) return;
 
     const number = normalize(text);
-    if (!number) return bot.sendMessage(uid, "❌ Invalid number format.");
+    if (!number) return bot.sendMessage(uid, "❌ Invalid number.");
 
     let ses = sessions[uid];
     if (!ses) ses = await createSession(uid);
 
     if (!ses.connected)
-        return bot.sendMessage(uid, "🔴 Not connected. Use /start");
+        return bot.sendMessage(uid, "❌ WhatsApp not connected. Use /start");
 
     bot.sendMessage(uid, "⏳ Checking WhatsApp…");
 
@@ -223,5 +233,9 @@ bot.on("message", async (msg) => {
 });
 
 // -----------------------------
+// START SERVER
+// -----------------------------
 const PORT = 8000;
-app.listen(PORT, () => console.log("Server running on port " + PORT));
+app.listen(PORT, () =>
+    console.log("Server running on http://0.0.0.0:" + PORT)
+);
