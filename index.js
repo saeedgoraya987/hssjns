@@ -204,19 +204,20 @@ async function fetchContactInfo(sock, number) {
 }
 
 // helper to fetch image buffer (native node fetchless)
+import https from "https";
+import http from "http";
+
 async function fetchBufferFromUrl(url) {
-  // use built-in https to avoid extra deps
   return new Promise((resolve) => {
     try {
-      const lib = url.startsWith("https") ? await import("https") : await import("http");
-      const http = lib.default;
-      http.get(url, (res) => {
-        const chunks = [];
-        res.on("data", (c) => chunks.push(c));
-        res.on("end", () => resolve(Buffer.concat(chunks)));
-        res.on("error", () => resolve(null));
+      const client = url.startsWith("https") ? https : http;
+
+      client.get(url, (res) => {
+        const data = [];
+        res.on("data", (chunk) => data.push(chunk));
+        res.on("end", () => resolve(Buffer.concat(data)));
       }).on("error", () => resolve(null));
-    } catch (e) {
+    } catch (err) {
       resolve(null);
     }
   });
