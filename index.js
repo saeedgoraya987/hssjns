@@ -7,7 +7,8 @@ import { webcrypto } from "crypto";
 globalThis.crypto = webcrypto;
 
 // --- Imports ---
-import makeWASocket, {
+import {
+  default as makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
