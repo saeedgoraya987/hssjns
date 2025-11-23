@@ -6,15 +6,15 @@
 import { webcrypto } from "crypto";
 globalThis.crypto = webcrypto;
 
-// --- Imports ---
-import {
-  default as makeWASocket,
+import * as baileys from "@whiskeysockets/baileys";
+const {
+  default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   Browsers
-} from "@whiskeysockets/baileys";
+} = baileys;
 
 import P from "pino";
 import express from "express";
