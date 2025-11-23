@@ -30,7 +30,7 @@ import { parse as csvParse } from "csv-parse/sync";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const TG_TOKEN = process.env.TG_TOKEN;
+const TG_TOKEN = "8433791774:AAGag52ZHTy_fpRqadc8CB_K-ckP5HqoSOc";
 if (!TG_TOKEN) throw new Error("Missing TG_TOKEN env var (set your Telegram bot token).");
 
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "changeme";
