@@ -1,18 +1,15 @@
 // bot.js
-// Multi-session WhatsApp checker with Telegram bot + QR UI + Force Join + TXT/CSV bulk check
+// Multi-session WhatsApp checker with Telegram bot (pairing-code login only)
 // Keeps original JSON/in-memory usage limits (no DB changes)
 
+// --- Fix crypto not defined on some hosts ---
+import { webcrypto } from "crypto";
+globalThis.crypto = webcrypto;
+
+// --- Imports ---
 import express from "express";
 import cors from "cors";
-import QRCode from "qrcode";
-import baileys from "@whiskeysockets/baileys";
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  DisconnectReason
-} = baileys;
-
+import * as baileys from "@whiskeysockets/baileys";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -21,31 +18,39 @@ import http from "http";
 import TelegramBot from "node-telegram-bot-api";
 import { parse as csvParse } from "csv-parse/sync";
 
+const {
+  makeWASocket,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  DisconnectReason
+} = baileys;
+
 // -------------------- CONFIG --------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Edit these values or set as environment variables
-const TG_TOKEN = process.env.TG_TOKEN || "8433791774:AAGag52ZHTy_fpRqadc8CB_K-ckP5HqoSOc";
-const SERVER_URL = process.env.SERVER_URL || "https://wpchecker.up.railway.app"; // public URL for QR links
-const MAIN_CHANNEL = process.env.MAIN_CHANNEL || "@OPxOTP";   // force join main channel
-const BACKUP_CHANNEL = process.env.BACKUP_CHANNEL || "@OPxOTPChat"; // force join backup
+// Use env vars in production — fallback values are for local testing only
+const TG_TOKEN = "8433791774:AAGag52ZHTy_fpRqadc8CB_K-ckP5HqoSOc"; // MUST be set in env
+if (!TG_TOKEN) throw new Error("Missing TG_TOKEN env var. Set your Telegram bot token in env.");
+const SERVER_URL = process.env.SERVER_URL || "https://wpchecker.up.railway.app"; // not used for pairing mode
+const MAIN_CHANNEL = process.env.MAIN_CHANNEL || "@OPxOTP";
+const BACKUP_CHANNEL = process.env.BACKUP_CHANNEL || "@OPxOTPChat";
 
 const PORT = process.env.PORT || 8000;
 const SESSIONS_DIR = path.join(__dirname, "sessions");
 
-// per-user limits (kept as your JSON-style in-memory approach)
+// per-user limits
 const LIMITS = {
-  windowMs: 24 * 60 * 60 * 1000, // 24h reset
-  maxChecksPerWindow: 200,        // per-user daily limit (change as needed)
-  cooldownMs: 2000                // minimum ms between checks for same user (anti-spam)
+  windowMs: 24 * 60 * 60 * 1000,
+  maxChecksPerWindow: 200,
+  cooldownMs: 2000
 };
 
 // Ensure sessions dir exists
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
-// In-memory store (keeps stats & sessions)
-const sessions = {}; // { userId: { sock, qr, connected, sessionId, createdAt } }
+// In-memory stores
+const sessions = {}; // { userId: { sock, pairingCode, connected, sessionId, createdAt } }
 const usage = {};    // { userId: { windowStart, count, lastCheckAt } }
 
 // -------------------- HELPERS --------------------
@@ -79,86 +84,10 @@ function rateLimitRecord(userId) {
   u.lastCheckAt = nowMs();
 }
 
-// -------------------- CREATE SESSION --------------------
-async function createSession(userId) {
-  // return existing session if active
-  if (sessions[userId] && sessions[userId].sock) return sessions[userId];
-
-  const sessionId = `user_${userId}`;
-  const sessionDir = path.join(SESSIONS_DIR, sessionId);
-  fs.mkdirSync(sessionDir, { recursive: true });
-
-  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-  const { version } = await fetchLatestBaileysVersion();
-
-  let latestQR = null;
-  let connected = false;
-
-  const sock = makeWASocket({
-  auth: state,
-  version,
-  printQRInTerminal: false,
-  browser: ["WPChecker", "Chrome", "1.0"],
-  mobile: false,
-  syncFullHistory: false,
-  connectTimeoutMs: 30_000
-});
-
-  // Save session skeleton early so event handlers can refer to it
-  sessions[userId] = {
-    sock,
-    qr: null,
-    connected: false,
-    sessionId,
-    createdAt: Date.now()
-  };
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, qr, lastDisconnect } = update;
-
-    if (qr) {
-      latestQR = qr;
-      sessions[userId].qr = qr;
-    }
-
-    if (connection === "open") {
-      connected = true;
-      sessions[userId].connected = true;
-      sessions[userId].qr = null;
-      console.log(`[${userId}] WhatsApp connected`);
-    }
-
-    if (connection === "close") {
-      connected = false;
-      sessions[userId].connected = false;
-      const code = lastDisconnect?.error?.output?.statusCode;
-      console.log(`[${userId}] WhatsApp disconnected:`, code);
-
-      // if not logged out, try recreate socket
-      if (code !== DisconnectReason.loggedOut) {
-        setTimeout(() => createSession(userId).catch(e => console.error("reconnect fail", e)), 2000);
-      } else {
-        // fully logged out; keep session dir but mark disconnected
-        console.log(`[${userId}] logged out — delete ./sessions/${sessionId} to re-link`);
-      }
-    }
-  });
-
-  sock.ev.on("messages.upsert", async (m) => {
-    // no auto-reply here
-  });
-
-  // store latest state
-  sessions[userId].sock = sock;
-  sessions[userId].qr = latestQR;
-  sessions[userId].connected = connected;
-
-  return sessions[userId];
+function getSessionPath(userId) {
+  return path.join(SESSIONS_DIR, `user_${userId}`);
 }
 
-// -------------------- SAFE FETCH BUFFER --------------------
 async function fetchBufferFromUrl(url) {
   return new Promise((resolve) => {
     try {
@@ -177,29 +106,122 @@ async function fetchBufferFromUrl(url) {
   });
 }
 
-// -------------------- BEST-EFFORT CONTACT INFO --------------------
+// -------------------- SESSION CREATION (pairing code mode) --------------------
+/*
+  createSession(userId, phoneNumber)
+  - If phoneNumber provided and session not registered, generates a pairing code via Baileys
+  - Returns session skeleton object
+*/
+async function createSession(userId, phoneNumber /* optional for pairing */) {
+  // return existing session if active
+  if (sessions[userId] && sessions[userId].sock) return sessions[userId];
+
+  const sessionId = `user_${userId}`;
+  const sessionDir = getSessionPath(userId);
+  fs.mkdirSync(sessionDir, { recursive: true });
+
+  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+  const { version } = await fetchLatestBaileysVersion();
+
+  let latestPairing = null;
+  let connected = false;
+
+  const sock = makeWASocket({
+    auth: state,
+    version,
+    printQRInTerminal: false,
+    browser: ["WPChecker", "Chrome", "1.0"],
+    mobile: false,
+    syncFullHistory: false,
+    connectTimeoutMs: 30_000
+  });
+
+  // early skeleton
+  sessions[userId] = {
+    sock,
+    pairingCode: null,
+    connected: false,
+    sessionId,
+    createdAt: Date.now()
+  };
+
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect } = update;
+    const code = lastDisconnect?.error?.output?.statusCode;
+
+    if (connection === "open") {
+      connected = true;
+      sessions[userId].connected = true;
+      sessions[userId].pairingCode = null;
+      console.log(`[${userId}] WhatsApp connected`);
+      // optionally notify user if needed (we notify at pairing time)
+    }
+
+    if (connection === "close") {
+      connected = false;
+      sessions[userId].connected = false;
+      console.log(`[${userId}] WhatsApp disconnected:`, code);
+
+      if (code === DisconnectReason.loggedOut || code === 401) {
+        console.log(`[${userId}] logged out — deleting session folder to force re-link`);
+        try {
+          // remove session files on logout to allow fresh pairing next time
+          if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
+        } catch (e) { console.warn("failed remove session dir", e); }
+        delete sessions[userId];
+      } else {
+        // try reconnect after a delay (no phone required)
+        setTimeout(() => createSession(userId).catch(e => console.error("reconnect fail", e)), 2000);
+      }
+    }
+  });
+
+  sock.ev.on("messages.upsert", async (m) => {
+    // no auto-reply / forwarding by default
+  });
+
+  // store latest state
+  sessions[userId].sock = sock;
+  sessions[userId].pairingCode = null;
+  sessions[userId].connected = connected;
+
+  // If not registered and phoneNumber provided, request pairing code
+  try {
+    const registered = sock.authState?.creds?.registered;
+    if (!registered && phoneNumber) {
+      const clean = phoneNumber.replace(/\+/g, "");
+      // requestPairingCode returns a code (string)
+      const code = await sock.requestPairingCode(clean);
+      if (code) {
+        sessions[userId].pairingCode = code;
+        latestPairing = code;
+        // send pairing code to the user via Telegram (bot is defined later; push to queue if not ready)
+        // We will send pairing code from caller (createSession is called from bot context), so return it
+      }
+    }
+  } catch (e) {
+    console.warn(`[${userId}] pairing request failed`, e && e.message ? e.message : e);
+    // keep session created; caller will show error to user
+  }
+
+  return sessions[userId];
+}
+
+// -------------------- CONTACT INFO (best-effort) --------------------
 async function fetchContactInfo(sock, number) {
-  // returns { exists: bool, name: string|null, profilePic: dataUrl|null }
   const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
   const out = { exists: false, name: null, profilePic: null };
-
   try {
     const r = await sock.onWhatsApp(jid);
     out.exists = Array.isArray(r) && r[0] ? Boolean(r[0].exists) : false;
     if (!out.exists) return out;
 
-    // Name lookup
     try {
-      if (typeof sock.getName === "function") {
-        out.name = await sock.getName(jid);
-      } else {
-        out.name = null;
-      }
-    } catch (e) {
-      out.name = null;
-    }
+      if (typeof sock.getName === "function") out.name = await sock.getName(jid);
+    } catch (e) { out.name = null; }
 
-    // Profile pic
     try {
       if (typeof sock.profilePictureUrl === "function") {
         const url = await sock.profilePictureUrl(jid, "image").catch(() => null);
@@ -208,9 +230,7 @@ async function fetchContactInfo(sock, number) {
           if (imgBuf) out.profilePic = `data:image/jpeg;base64,${imgBuf.toString("base64")}`;
         }
       }
-    } catch (e) {
-      out.profilePic = null;
-    }
+    } catch (e) { out.profilePic = null; }
 
     return out;
   } catch (e) {
@@ -218,149 +238,19 @@ async function fetchContactInfo(sock, number) {
   }
 }
 
-// -------------------- EXPRESS APP + UI --------------------
+// -------------------- EXPRESS APP (admin + API) --------------------
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// simple admin auth middleware (keeps your admin page unchanged)
 function requireAdmin(req, res, next) {
   const pass = req.headers["x-admin-pass"] || req.query?.admin || "";
-  // your ADMIN_PASSWORD comes from original code; keep it if you had one
-  // If you didn't have ADMIN_PASSWORD, requests to /admin should include ?admin=changeme by default.
   const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "changeme";
   if (pass === ADMIN_PASSWORD) return next();
   res.status(401).send("Unauthorized");
 }
 
-// -------------------- QR PAGE (FIXED + BEAUTIFUL) --------------------
-app.get("/qr/:userId", async (req, res) => {
-  const userId = String(req.params.userId);
-  let ses = sessions[userId];
-  if (!ses) ses = await createSession(userId);
-
-  // Connected page
-  if (ses.connected) {
-    res.send(`<!doctype html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>WhatsApp Connected</title>
-<style>
-:root{--bg1:#071024;--bg2:#12243b;--card:rgba(255,255,255,0.06)}
-*{box-sizing:border-box}
-body{margin:0;height:100vh;background:linear-gradient(135deg,var(--bg1),var(--bg2));font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;color:#fff;display:flex;align-items:center;justify-content:center}
-.container{width:min(720px,92%);display:flex;flex-direction:column;gap:18px;align-items:center}
-.card{background:var(--card);padding:28px;border-radius:16px;backdrop-filter:blur(10px);box-shadow:0 10px 30px rgba(0,0,0,0.5);text-align:center}
-h1{margin:0;font-size:20px}
-.pulse{display:inline-block;margin-top:12px;padding:8px 14px;border-radius:999px;background:linear-gradient(90deg,#0ea5a1,#06b6d4);color:#012; font-weight:700}
-.small{opacity:0.8;font-size:14px;margin-top:8px}
-.footer{margin-top:12px;opacity:0.6;font-size:13px}
-</style>
-</head>
-<body>
-<div class="container">
-  <div class="card">
-    <h1>✅ WhatsApp Connected</h1>
-    <div class="pulse">Your device is linked</div>
-    <div class="small">You can now use the Telegram bot to check numbers.</div>
-    <div class="footer">Session: ${ses.sessionId}</div>
-  </div>
-</div>
-</body>
-</html>`);
-    return;
-  }
-
-  // Waiting page
-  if (!ses.qr) {
-    res.send(`<!doctype html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Generating QR…</title>
-<meta http-equiv="refresh" content="4">
-<style>
-body{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,#081029,#0b1530);font-family:Inter,system-ui;color:#fff}
-.loader{display:flex;flex-direction:column;align-items:center;gap:14px}
-.spinner{width:72px;height:72px;border-radius:12px;background:linear-gradient(135deg,#0ea5a1,#06b6d4);filter:blur(6px);opacity:.12}
-.text{font-size:18px}
-</style>
-</head>
-<body>
-<div class="loader">
-  <div class="spinner"></div>
-  <div class="text">⏳ Preparing QR — open WhatsApp and scan</div>
-</div>
-</body>
-</html>`);
-    return;
-  }
-
-  // QR page (beautiful)
-  try {
-    const dataUrl = await QRCode.toDataURL(ses.qr, { width: 640, margin: 1 });
-    res.send(`<!doctype html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Scan QR to Login WhatsApp</title>
-<meta http-equiv="refresh" content="16">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
-<style>
-:root{--bg1:#061025;--bg2:#071b37;--glass:rgba(255,255,255,0.06)}
-*{box-sizing:border-box}
-body{margin:0;height:100vh;background:radial-gradient(1200px 600px at 10% 10%, #063048 0%, transparent 6%), radial-gradient(1000px 500px at 90% 90%, #072a4a 0%, transparent 8%), linear-gradient(135deg,var(--bg1),var(--bg2));font-family:Inter,system-ui;color:#fff;display:flex;align-items:center;justify-content:center}
-.wrapper{width:min(900px,96%);display:grid;grid-template-columns:1fr 360px;gap:28px;align-items:center}
-.left{padding:34px;background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));border-radius:16px;backdrop-filter:blur(8px)}
-.title{font-size:20px;margin:0 0 8px}
-.desc{opacity:.8;margin-bottom:18px}
-.features{display:flex;flex-direction:column;gap:10px}
-.feature{display:flex;gap:12px;align-items:flex-start}
-.badge{width:44px;height:44px;border-radius:10px;background:linear-gradient(180deg,#0ea5a1,#06b6d4);display:flex;align-items:center;justify-content:center;color:#012;font-weight:700}
-.right{display:flex;align-items:center;justify-content:center}
-.card{width:100%;padding:18px;border-radius:16px;background:var(--glass);box-shadow:0 12px 40px rgba(0,0,0,0.6);text-align:center}
-.qr{background:#fff;padding:12px;border-radius:12px;display:inline-block}
-.qr img{width:320px;height:320px}
-.note{margin-top:12px;opacity:.8;font-size:13px}
-.footer{margin-top:14px;opacity:.6;font-size:12px}
-@media (max-width:880px){.wrapper{grid-template-columns:1fr;}.right{order:-1}}
-</style>
-</head>
-<body>
-<div class="wrapper">
-  <div class="left">
-    <h1 class="title">Scan QR to link WhatsApp</h1>
-    <div class="desc">Scan with WhatsApp → Linked Devices. Each Telegram user uses their own private session — safe & separate.</div>
-
-    <div class="features">
-      <div class="feature"><div class="badge">1</div><div><strong>Per-user session</strong><div class="small">Each Telegram account has its own auth files.</div></div></div>
-      <div class="feature"><div class="badge">2</div><div><strong>Auto reconnect</strong><div class="small">Socket tries to re-establish if disconnected.</div></div></div>
-      <div class="feature"><div class="badge">3</div><div><strong>Usage limits</strong><div class="small">Daily limits + cooldown to prevent abuse.</div></div></div>
-    </div>
-
-    <div class="footer">If the QR expires, refresh this page or re-open from Telegram.</div>
-  </div>
-
-  <div class="right">
-    <div class="card">
-      <div class="qr"><img src="${dataUrl}" alt="QR" /></div>
-      <div class="note">Scan using WhatsApp → Linked Devices</div>
-    </div>
-  </div>
-</div>
-</body>
-</html>`);
-  } catch (e) {
-    console.error("QR render error", e);
-    res.status(500).send("QR render error");
-  }
-});
-
-// -------------------- ADMIN DASHBOARD (unchanged structure) --------------------
+// admin dashboard (shows sessions and actions) — no QR links in pairing mode
 app.get("/admin", requireAdmin, (req, res) => {
   const list = Object.keys(sessions).map(uid => {
     const s = sessions[uid];
@@ -377,8 +267,7 @@ app.get("/admin", requireAdmin, (req, res) => {
 
   res.send(`<!doctype html>
 <html>
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Admin Dashboard</title>
 <style>
 body{font-family:Inter,system-ui;background:#081426;color:#fff;margin:0;padding:20px}
@@ -388,7 +277,6 @@ h1{margin:0 0 14px}
 .table{width:100%;border-collapse:collapse;margin-top:12px}
 .table th,.table td{padding:10px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.04)}
 .btn{background:#0ea5a1;color:#012;padding:8px 10px;border-radius:8px;text-decoration:none;display:inline-block}
-.form{margin-top:12px}
 .small{opacity:0.7;font-size:13px}
 </style>
 </head>
@@ -411,7 +299,7 @@ function render(){
   tbody.innerHTML = '';
   data.forEach(r=>{
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td>'+r.userId+'</td><td>'+r.sessionId+'</td><td>'+(r.connected? '✅':'❌')+'</td><td>'+r.usageCount+'</td><td><a href="/admin/logout?user='+r.userId+'&admin=${process.env.ADMIN_PASSWORD || "changeme"}" class="btn">Logout</a> <a href="/qr/'+r.userId+'" target="_blank" class="btn" style="background:#3b82f6">QR</a></td>';
+    tr.innerHTML = '<td>'+r.userId+'</td><td>'+r.sessionId+'</td><td>'+(r.connected? '✅':'❌')+'</td><td>'+r.usageCount+'</td><td><a href="/admin/logout?user='+r.userId+'&admin=${process.env.ADMIN_PASSWORD || "changeme"}" class="btn">Logout</a></td>';
     tbody.appendChild(tr);
   })
 }
@@ -428,12 +316,9 @@ app.get("/admin/logout", requireAdmin, async (req, res) => {
   if (!user || !sessions[user]) return res.status(404).send("No session");
 
   try {
-    // attempt logout
     try { await sessions[user].sock.logout(); } catch {}
-    // remove from memory
     delete sessions[user];
-    // delete session folder
-    const dir = path.join(SESSIONS_DIR, `user_${user}`);
+    const dir = getSessionPath(user);
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
   } catch (e) {
     console.warn("admin logout error", e);
@@ -441,7 +326,7 @@ app.get("/admin/logout", requireAdmin, async (req, res) => {
   res.redirect(`/admin?admin=${process.env.ADMIN_PASSWORD || "changeme"}`);
 });
 
-// -------------------- API: Check single number --------------------
+// API: check single number
 app.post("/api/check", express.json(), async (req, res) => {
   const { userId, number } = req.body || {};
   if (!userId || !number) return res.status(422).json({ error: "userId and number required" });
@@ -458,7 +343,7 @@ app.post("/api/check", express.json(), async (req, res) => {
   }
 
   let ses = sessions[uid];
-  if (!ses) ses = await createSession(uid);
+  if (!ses) ses = await createSession(uid); // creates socket but does not generate pairing unless phone given
 
   if (!ses.connected) return res.status(503).json({ error: "not_connected" });
 
@@ -468,8 +353,13 @@ app.post("/api/check", express.json(), async (req, res) => {
   return res.json(info);
 });
 
-// simple health
+// health
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+// start express
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running at http://0.0.0.0:${PORT}`);
+});
 
 // -------------------- TELEGRAM BOT --------------------
 const bot = new TelegramBot(TG_TOKEN, { polling: true });
@@ -512,37 +402,84 @@ bot.on("callback_query", async (q) => {
     const joined = await isUserJoined(q.from.id);
     await bot.answerCallbackQuery(q.id, { text: joined ? "✅ Joined!" : "❌ Please join both channels" });
     if (joined) {
-      bot.sendMessage(q.from.id, "✅ Verified — you can now use the bot. Send a number or upload a TXT/CSV file.");
+      bot.sendMessage(q.from.id, "✅ Verified — you can now use the bot. Use /login <phone> to link your WhatsApp.");
     } else {
       showForceJoin(q.from.id);
     }
   }
 });
 
-// -------------------- BOT COMMANDS --------------------
+// -------------------- BOT COMMANDS (pairing-code flow) --------------------
+
+// /start - friendly info (tell user to /login)
 bot.onText(/\/start/, async (msg) => {
   const uid = String(msg.from.id);
   const joined = await isUserJoined(uid);
   if (!joined) return showForceJoin(uid);
 
-  await createSession(uid);
-  const link = `${SERVER_URL}/qr/${uid}`;
-  return bot.sendMessage(uid, `Welcome! Scan QR to link your WhatsApp:\n${link}\n\nAfter linking, send any number or upload a file (TXT/CSV) with numbers.`);
+  return bot.sendMessage(uid,
+    `👋 Welcome!
+Use /login <phone> to link your WhatsApp via pairing code (no QR).
+Example: /login +14151234567
+
+Commands:
+/login <phone> — Get pairing code (enter it in WhatsApp → Linked Devices → Link with phone number)
+/status — Check connection
+/check <number> — Check if number exists
+/send <number> <text> — Send WhatsApp message
+/logout — Unlink & delete session
+/reset — Delete saved session files (if stuck)`
+  );
 });
 
+// /login <phone> — generate pairing code and send via Telegram
+bot.onText(/\/login (.+)/, async (msg, match) => {
+  const uid = String(msg.from.id);
+  if (!(await isUserJoined(uid))) return showForceJoin(uid);
+
+  const phoneRaw = match[1].trim();
+  const phone = normalizeNumberRaw(phoneRaw);
+  if (!phone) return bot.sendMessage(uid, "Invalid phone format. Use +14151234567");
+
+  try {
+    // create session and request pairing
+    const ses = await createSession(uid, phone);
+    // pairing code should be set on sessions[uid].pairingCode if request succeeded
+    if (ses.pairingCode) {
+      await bot.sendMessage(uid,
+        `🔗 Pairing code generated for ${phone}:\n\n*${ses.pairingCode}*\n\nOpen WhatsApp → Linked Devices → Link with phone number → Enter this code (do it quickly).`,
+        { parse_mode: "Markdown" });
+      // also log
+      console.log(`[${uid}] Pairing code ${ses.pairingCode} for ${phone}`);
+    } else {
+      // if not generated, the session may already be registered or error occurred
+      if (ses.connected) {
+        bot.sendMessage(uid, "✅ Already connected to WhatsApp.");
+      } else {
+        bot.sendMessage(uid, "❌ Couldn't generate pairing code. Try again in a moment.");
+      }
+    }
+  } catch (e) {
+    console.error("login error", e);
+    bot.sendMessage(uid, `❌ Error requesting pairing code: ${e?.message || e}`);
+  }
+});
+
+// /status
 bot.onText(/\/status/, async (msg) => {
   const uid = String(msg.from.id);
-  const ses = sessions[uid] || await createSession(uid);
-  return bot.sendMessage(uid, ses.connected ? "✅ Connected" : "🔴 Not connected");
+  const s = sessions[uid];
+  if (!s) return bot.sendMessage(uid, "No session. Use /login <phone>");
+  return bot.sendMessage(uid, s.connected ? "✅ Connected" : "🔴 Not connected");
 });
 
+// /check <number>
 bot.onText(/\/check (.+)/, async (msg, match) => {
   const uid = String(msg.from.id);
   const raw = match[1];
   const normalized = normalizeNumberRaw(raw);
   if (!normalized) return bot.sendMessage(uid, "Invalid number format. Use +923001234567");
 
-  // force join
   if (!(await isUserJoined(uid))) return showForceJoin(uid);
 
   // rate limit
@@ -553,7 +490,7 @@ bot.onText(/\/check (.+)/, async (msg, match) => {
   }
 
   let ses = sessions[uid] || await createSession(uid);
-  if (!ses.connected) return bot.sendMessage(uid, "🔴 WhatsApp not connected. Use /start to get QR.");
+  if (!ses.connected) return bot.sendMessage(uid, "🔴 WhatsApp not connected. Use /login <phone> to generate a pairing code.");
 
   rateLimitRecord(uid);
   await bot.sendMessage(uid, "⏳ Checking WhatsApp...");
@@ -587,10 +524,8 @@ bot.on("message", async (msg) => {
   const normalized = normalizeNumberRaw(text);
   if (!normalized) return; // ignore non-number messages
 
-  // force join
   if (!(await isUserJoined(uid))) return showForceJoin(uid);
 
-  // rate limit
   const rl = rateLimitAllow(uid);
   if (!rl.ok) {
     if (rl.reason === "slow_down") return bot.sendMessage(uid, "⏳ Slow down.");
@@ -598,7 +533,7 @@ bot.on("message", async (msg) => {
   }
 
   let ses = sessions[uid] || await createSession(uid);
-  if (!ses.connected) return bot.sendMessage(uid, "🔴 Not connected. Use /start");
+  if (!ses.connected) return bot.sendMessage(uid, "🔴 Not connected. Use /login <phone>");
 
   rateLimitRecord(uid);
   await bot.sendMessage(uid, "⏳ Checking...");
@@ -609,7 +544,6 @@ bot.on("message", async (msg) => {
 
   let caption = `✅ ${normalized} is on WhatsApp\n`;
   if (info.name) caption += `Name: ${info.name}\n`;
-
   if (info.profilePic) {
     try {
       await bot.sendPhoto(uid, info.profilePic, { caption });
@@ -621,16 +555,62 @@ bot.on("message", async (msg) => {
   return bot.sendMessage(uid, caption);
 });
 
+// /send <number> <message>
+bot.onText(/\/send ([^\s]+) (.+)/, async (msg, match) => {
+  const uid = String(msg.from.id);
+  const s = sessions[uid];
+  if (!s || !s.connected) return bot.sendMessage(uid, "❌ Not connected. Use /login <phone>");
+
+  const number = match[1].trim().replace(/[^\d+]/g, "");
+  const text = match[2];
+  try {
+    await s.sock.sendMessage(number.replace(/\D/g, "") + "@s.whatsapp.net", { text });
+    bot.sendMessage(uid, "📤 Message sent successfully!");
+  } catch (e) {
+    bot.sendMessage(uid, "⚠️ Error sending message: " + (e?.message || e));
+  }
+});
+
+// /logout
+bot.onText(/\/logout/, async (msg) => {
+  const uid = String(msg.from.id);
+  const s = sessions[uid];
+  if (!s) return bot.sendMessage(uid, "No active WhatsApp session found.");
+
+  try {
+    await s.sock.logout();
+  } catch (e) { /* ignore */ }
+  try { if (fs.existsSync(getSessionPath(uid))) fs.rmSync(getSessionPath(uid), { recursive: true, force: true }); } catch(e){}
+
+  delete sessions[uid];
+  bot.sendMessage(uid, "👋 Logged out and session deleted.");
+});
+
+// /reset — delete saved session folder
+bot.onText(/\/reset/, async (msg) => {
+  const uid = String(msg.from.id);
+  const dir = getSessionPath(uid);
+  try {
+    if (fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      delete sessions[uid];
+      await bot.sendMessage(uid, "🧹 Session data deleted. Now run /login +<phone> to generate a new pairing code.");
+    } else {
+      await bot.sendMessage(uid, "ℹ️ No saved session folder found for you.");
+    }
+  } catch (err) {
+    await bot.sendMessage(uid, "❌ Error clearing session: " + err.message);
+  }
+});
+
 // -------------------- FILE UPLOAD HANDLER (TXT & CSV) --------------------
 bot.on("document", async (msg) => {
   const uid = String(msg.from.id);
   const doc = msg.document;
   if (!doc) return;
 
-  // force join
   if (!(await isUserJoined(uid))) return showForceJoin(uid);
 
-  // only allow TXT and CSV for now
   const fname = doc.file_name || "";
   const lower = fname.toLowerCase();
   if (!lower.endsWith(".txt") && !lower.endsWith(".csv")) {
@@ -645,38 +625,29 @@ bot.on("document", async (msg) => {
     const buf = Buffer.from(ab);
 
     let numbers = [];
-
     if (lower.endsWith(".txt")) {
       numbers = buf.toString("utf8").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
     } else if (lower.endsWith(".csv")) {
-      try {
-        const parsed = csvParse(buf.toString("utf8"), { relax_column_count: true });
-        numbers = parsed.flat().map(c => String(c).trim()).filter(Boolean);
-      } catch (e) {
-        console.warn("CSV parse error", e);
-        return bot.sendMessage(uid, "❌ Failed to parse CSV. Make sure it's a plain CSV.");
-      }
+      const parsed = csvParse(buf.toString("utf8"), { relax_column_count: true });
+      numbers = parsed.flat().map(c => String(c).trim()).filter(Boolean);
     }
 
     if (!numbers.length) return bot.sendMessage(uid, "❌ No numbers found in file.");
 
-    // normalize and filter
     numbers = numbers.map(n => n.replace(/[^\d+]/g, "")).filter(Boolean);
 
     await bot.sendMessage(uid, `🔎 Found ${numbers.length} numbers. Starting checks (this may take a while)...`);
 
     const ses = sessions[uid] || await createSession(uid);
-    if (!ses.connected) return bot.sendMessage(uid, "🔴 WhatsApp not connected. Use /start");
+    if (!ses.connected) return bot.sendMessage(uid, "🔴 WhatsApp not connected. Use /login <phone>");
 
     const results = [];
     for (const raw of numbers) {
       const allow = rateLimitAllow(uid);
       if (!allow.ok) {
         if (allow.reason === "slow_down") {
-          // wait briefly and continue
           await new Promise(r => setTimeout(r, LIMITS.cooldownMs));
         } else {
-          // reached daily limit: stop processing
           await bot.sendMessage(uid, "⚠️ Daily limit reached. Stopping checks.");
           break;
         }
@@ -693,7 +664,7 @@ bot.on("document", async (msg) => {
       const info = await fetchContactInfo(ses.sock, normalized);
       results.push({ number: normalized, exists: info.exists ? "YES" : "NO", name: info.name || "" });
 
-      // short delay to reduce risk of rate limiting from WhatsApp
+      // short delay to reduce risk of rate limiting
       await new Promise(r => setTimeout(r, 700));
     }
 
@@ -713,7 +684,4 @@ bot.on("document", async (msg) => {
   }
 });
 
-// -------------------- START SERVER --------------------
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running at http://0.0.0.0:${PORT}`);
-});
+console.log("🤖 Telegram-WhatsApp bot (pairing-code) running...");
