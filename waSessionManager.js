@@ -1,12 +1,14 @@
-import makeWASocket, {
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  DisconnectReason
-} from "@whiskeysockets/baileys";
-
+import baileys from "@whiskeysockets/baileys";
 import fs from "fs";
 import path from "path";
 import QRCode from "qrcode";
+
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  DisconnectReason
+} = baileys;
 
 const sessions = new Map();
 
@@ -26,19 +28,15 @@ export async function getOrCreateSession(tgUserId, notify) {
     browser: ["TelegramBot", "Chrome", "1.0"]
   });
 
-  const session = {
-    sock,
-    connected: false
-  };
-
+  const session = { sock, connected: false };
   sessions.set(tgUserId, session);
 
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (u) => {
     if (u.qr) {
-      const qrBuffer = await QRCode.toBuffer(u.qr);
-      await notify({ type: "qr", data: qrBuffer });
+      const qr = await QRCode.toBuffer(u.qr);
+      await notify({ type: "qr", data: qr });
     }
 
     if (u.connection === "open") {
@@ -49,7 +47,6 @@ export async function getOrCreateSession(tgUserId, notify) {
     if (u.connection === "close") {
       session.connected = false;
       const code = u.lastDisconnect?.error?.output?.statusCode;
-
       if (code === DisconnectReason.loggedOut) {
         sessions.delete(tgUserId);
         await notify({ type: "text", data: "❌ Logged out. Use /link again." });
