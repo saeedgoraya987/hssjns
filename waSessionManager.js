@@ -1,9 +1,12 @@
+// ---- WebCrypto polyfill (REQUIRED) ----
+import { webcrypto } from "crypto";
+globalThis.crypto = webcrypto;
+
+// ---- Baileys ----
 import baileys from "@whiskeysockets/baileys";
 import fs from "fs";
 import path from "path";
 import QRCode from "qrcode";
-import { webcrypto } from "crypto";
-globalThis.crypto = webcrypto;
 
 const {
   default: makeWASocket,
@@ -14,7 +17,7 @@ const {
 
 const sessions = new Map();
 
-export async function getOrCreateSession(tgUserId, notify) {
+export async function getOrCreateSession(tgUserId, notify = async () => {}) {
   if (sessions.has(tgUserId)) return sessions.get(tgUserId);
 
   const baseDir = path.join("sessions", String(tgUserId));
@@ -51,7 +54,6 @@ export async function getOrCreateSession(tgUserId, notify) {
       const code = u.lastDisconnect?.error?.output?.statusCode;
       if (code === DisconnectReason.loggedOut) {
         sessions.delete(tgUserId);
-        await notify({ type: "text", data: "❌ Logged out. Use /link again." });
       }
     }
   });
