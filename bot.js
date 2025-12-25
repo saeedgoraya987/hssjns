@@ -7,8 +7,6 @@ import { normalizeNumber, toJid } from "./utils.js";
 import { webcrypto } from "crypto";
 globalThis.crypto = webcrypto;
 
-import TelegramBot from "node-telegram-bot-api";
-
 const bot = new TelegramBot(process.env.TG_TOKEN, { polling: true });
 const limit = pLimit(10);
 
