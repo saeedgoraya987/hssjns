@@ -10,6 +10,7 @@
     "@whiskeysockets/baileys": "^6.7.1",
     "node-telegram-bot-api": "^0.66.0",
     "qrcode": "^1.5.4",
-    "p-limit": "^4.0.0"
+    "p-limit": "^4.0.0",
+    "dotenv": "^16.4.5"
   }
 }
