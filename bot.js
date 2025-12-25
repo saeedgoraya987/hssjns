@@ -1,8 +1,12 @@
-// ---- WebCrypto polyfill ----
+// ================================
+// WebCrypto polyfill (REQUIRED)
+// ================================
 import { webcrypto } from "crypto";
 globalThis.crypto = webcrypto;
 
-// ---- Imports ----
+// ================================
+// Imports
+// ================================
 import TelegramBot from "node-telegram-bot-api";
 import fs from "fs";
 import pLimit from "p-limit";
@@ -10,25 +14,52 @@ import pLimit from "p-limit";
 import { getOrCreateSession } from "./waSessionManager.js";
 import { normalizeNumber, toJid } from "./utils.js";
 
-const bot = new TelegramBot(process.env.TG_TOKEN, { polling: true });
-const limit = pLimit(10);
+// ================================
+// Telegram Bot Init (Railway-safe)
+// ================================
+const bot = new TelegramBot(process.env.TG_TOKEN, {
+  polling: {
+    autoStart: true,
+    params: {
+      timeout: 30
+    }
+  }
+});
+
+// Drop stuck updates (CRITICAL on Railway)
+bot.deleteWebhook({ drop_pending_updates: true })
+  .then(() => console.log("🧹 Dropped pending Telegram updates"))
+  .catch(() => {});
+
+// Polling error visibility
+bot.on("polling_error", (err) => {
+  console.error("🚨 POLLING ERROR:", err.message);
+});
 
 console.log("🤖 Telegram bot started");
 
-// ---------- /start ----------
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(
+const limit = pLimit(10);
+
+// ================================
+// /start
+// ================================
+bot.onText(/\/start/, async (msg) => {
+  await bot.sendMessage(
     msg.chat.id,
     `🤖 *WhatsApp Checker Bot*
 
 /pair <number> – Link WhatsApp
 /check <number> – Check number
-/logout – Logout WhatsApp`,
+/logout – Logout WhatsApp
+
+Each user has their own WhatsApp.`,
     { parse_mode: "Markdown" }
   );
 });
 
-// ---------- /pair ----------
+// ================================
+// /pair <number>
+// ================================
 bot.onText(/\/pair (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
@@ -42,14 +73,17 @@ bot.onText(/\/pair (.+)/, async (msg, match) => {
   try {
     session = await getOrCreateSession(userId);
   } catch {
-    return bot.sendMessage(chatId, "❌ Failed to create session");
+    return bot.sendMessage(chatId, "❌ Failed to create WhatsApp session");
   }
 
   if (session.connected) {
-    return bot.sendMessage(chatId, "⚠️ Already linked. Use /logout first.");
+    return bot.sendMessage(
+      chatId,
+      "⚠️ WhatsApp already linked.\nUse /logout first."
+    );
   }
 
-  // ⏳ allow socket to initialize
+  // Allow socket to initialize
   await new Promise((r) => setTimeout(r, 1500));
 
   try {
@@ -59,9 +93,11 @@ bot.onText(/\/pair (.+)/, async (msg, match) => {
 
     await bot.sendMessage(
       chatId,
-      `📱 *Pairing Code*
+      `📱 *WhatsApp Pairing Code*
 
-WhatsApp → Linked Devices → Link with phone number
+Open WhatsApp → Linked Devices  
+Tap *Link with phone number*  
+Enter this code:
 
 *${code}*`,
       { parse_mode: "Markdown" }
@@ -70,12 +106,17 @@ WhatsApp → Linked Devices → Link with phone number
     console.error("PAIR ERROR:", err);
     await bot.sendMessage(
       chatId,
-      "❌ Pairing failed.\n\nUse:\n/logout\nthen try again."
+      "❌ Failed to generate pairing code.\n\n" +
+      "👉 Send /logout\n" +
+      "👉 Wait 10 seconds\n" +
+      "👉 Try /pair again"
     );
   }
 });
 
-// ---------- /check ----------
+// ================================
+// /check <number>
+// ================================
 bot.onText(/\/check (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
@@ -91,15 +132,21 @@ bot.onText(/\/check (.+)/, async (msg, match) => {
   }
 
   try {
-    const r = await session.sock.onWhatsApp(toJid(number));
-    const exists = r?.[0]?.exists;
-    bot.sendMessage(chatId, exists ? "✅ On WhatsApp" : "❌ Not on WhatsApp");
-  } catch {
-    bot.sendMessage(chatId, "❌ Check failed");
+    const res = await session.sock.onWhatsApp(toJid(number));
+    const exists = res?.[0]?.exists;
+    await bot.sendMessage(
+      chatId,
+      exists ? "✅ Number is on WhatsApp" : "❌ Not on WhatsApp"
+    );
+  } catch (err) {
+    console.error("CHECK ERROR:", err);
+    await bot.sendMessage(chatId, "❌ Check failed");
   }
 });
 
-// ---------- /logout ----------
+// ================================
+// /logout
+// ================================
 bot.onText(/\/logout/, async (msg) => {
   const userId = msg.from.id;
   const chatId = msg.chat.id;
@@ -111,5 +158,8 @@ bot.onText(/\/logout/, async (msg) => {
     });
   } catch {}
 
-  bot.sendMessage(chatId, "✅ Logged out. Use /pair again.");
+  await bot.sendMessage(
+    chatId,
+    "✅ Logged out.\nYou can now use /pair again."
+  );
 });
