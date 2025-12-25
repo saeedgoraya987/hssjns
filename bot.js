@@ -15,23 +15,18 @@ import { getOrCreateSession } from "./waSessionManager.js";
 import { normalizeNumber, toJid } from "./utils.js";
 
 // ================================
-// Telegram Bot Init (Railway-safe)
+// Telegram Bot Init (POLLING SAFE)
 // ================================
+if (!process.env.TG_TOKEN) {
+  console.error("❌ TG_TOKEN is missing");
+  process.exit(1);
+}
+
 const bot = new TelegramBot(process.env.TG_TOKEN, {
-  polling: {
-    autoStart: true,
-    params: {
-      timeout: 30
-    }
-  }
+  polling: true
 });
 
-// Drop stuck updates (CRITICAL on Railway)
-bot.deleteWebhook({ drop_pending_updates: true })
-  .then(() => console.log("🧹 Dropped pending Telegram updates"))
-  .catch(() => {});
-
-// Polling error visibility
+// Log polling errors (IMPORTANT)
 bot.on("polling_error", (err) => {
   console.error("🚨 POLLING ERROR:", err.message);
 });
@@ -106,10 +101,10 @@ Enter this code:
     console.error("PAIR ERROR:", err);
     await bot.sendMessage(
       chatId,
-      "❌ Failed to generate pairing code.\n\n" +
-      "👉 Send /logout\n" +
-      "👉 Wait 10 seconds\n" +
-      "👉 Try /pair again"
+      "❌ Pairing failed.\n\n" +
+      "1️⃣ Send /logout\n" +
+      "2️⃣ Wait 10 seconds\n" +
+      "3️⃣ Try /pair again"
     );
   }
 });
