@@ -5,8 +5,6 @@ import QRCode from "qrcode";
 import { webcrypto } from "crypto";
 globalThis.crypto = webcrypto;
 
-import baileys from "@whiskeysockets/baileys";
-
 const {
   default: makeWASocket,
   useMultiFileAuthState,
