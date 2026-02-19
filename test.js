@@ -9,7 +9,7 @@ const {
 // 🔥 Fix for default export
 const makeWASocket = baileys.default || baileys;
 
-const phoneNumber = "923091831496"; // change
+const phoneNumber = "923091731496"; // change
 
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState("./auth");
