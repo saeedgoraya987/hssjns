@@ -6,38 +6,35 @@ import {
 
 import P from "pino";
 
-// 🔴 CHANGE THIS
-// Must include country code
-// No +, no spaces, no leading 0
-const phoneNumber = "923091731496";
+const phoneNumber = "923091731496"; // CHANGE THIS
 
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState("./auth");
-
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     version,
     auth: state,
     logger: P({ level: "silent" }),
-    printQRInTerminal: false // IMPORTANT for pairing
+    printQRInTerminal: false
   });
 
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect } = update;
-
-    if (!sock.authState.creds.registered) {
-      try {
-        const code = await sock.requestPairingCode(phoneNumber);
-        console.log("\n🔐 YOUR PAIRING CODE:\n");
-        console.log(code);
-        console.log("\nOpen WhatsApp → Linked Devices → Link with phone number\n");
-      } catch (err) {
-        console.log("❌ Pairing error:", err?.message);
-      }
+  // 🔹 Request pairing code only once after socket created
+  if (!sock.authState.creds.registered) {
+    try {
+      const code = await sock.requestPairingCode(phoneNumber);
+      console.log("\n🔐 YOUR PAIRING CODE:\n");
+      console.log(code);
+      console.log("\nOpen WhatsApp → Linked Devices → Link with phone number\n");
+    } catch (err) {
+      console.log("❌ Pairing error:", err?.message);
     }
+  }
+
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect } = update;
 
     if (connection === "open") {
       console.log("✅ WhatsApp linked successfully!");
@@ -45,6 +42,9 @@ async function start() {
 
     if (connection === "close") {
       console.log("❌ Connection closed.");
+      if (lastDisconnect?.error) {
+        console.log("Reason:", lastDisconnect.error?.message);
+      }
     }
   });
 }
