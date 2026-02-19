@@ -1,8 +1,7 @@
 // ================================
 // WebCrypto polyfill (REQUIRED)
 // ================================
-import { webcrypto } from "crypto";
-globalThis.crypto = webcrypto;
+
 
 // ================================
 // Imports
