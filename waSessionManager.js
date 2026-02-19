@@ -1,15 +1,13 @@
 // ---- Baileys ----
-import baileys from "@whiskeysockets/baileys";
-import fs from "fs";
-import path from "path";
-import QRCode from "qrcode";
-
-const {
-  default: makeWASocket,
+import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason
-} = baileys;
+} from "@whiskeysockets/baileys";
+
+import fs from "fs";
+import path from "path";
+import QRCode from "qrcode";
 
 const sessions = new Map();
 
