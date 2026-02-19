@@ -14,8 +14,9 @@ const sessions = new Map();
 export async function getOrCreateSession(tgUserId, notify = async () => {}) {
   if (sessions.has(tgUserId)) return sessions.get(tgUserId);
 
-  const baseDir = path.join("sessions", String(tgUserId));
+  const baseDir = path.join(process.cwd(), "sessions", String(tgUserId));
   const authDir = path.join(baseDir, "auth");
+
   fs.mkdirSync(authDir, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
