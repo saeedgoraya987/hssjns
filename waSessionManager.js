@@ -1,7 +1,3 @@
-// ---- WebCrypto polyfill (REQUIRED) ----
-import { webcrypto } from "crypto";
-globalThis.crypto = webcrypto;
-
 // ---- Baileys ----
 import baileys from "@whiskeysockets/baileys";
 import fs from "fs";
