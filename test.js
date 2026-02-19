@@ -1,11 +1,15 @@
-import makeWASocket, {
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion
-} from "@itsukichan/baileys";
-
+import baileys from "@itsukichan/baileys";
 import P from "pino";
 
-const phoneNumber = "923091731496"; // change this
+const {
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion
+} = baileys;
+
+// 🔥 Fix for default export
+const makeWASocket = baileys.default || baileys;
+
+const phoneNumber = "923091831496"; // change
 
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState("./auth");
@@ -20,30 +24,23 @@ async function start() {
 
   sock.ev.on("creds.update", saveCreds);
 
-  // 🔥 EXACTLY as docs say
   if (!sock.authState.creds.registered) {
     try {
       const code = await sock.requestPairingCode(phoneNumber);
       console.log("\n🔐 PAIRING CODE:\n");
       console.log(code);
-      console.log("\nGo to WhatsApp → Linked Devices → Link with phone number\n");
+      console.log("\nWhatsApp → Linked Devices → Link with phone number\n");
     } catch (err) {
       console.log("❌ Pairing error:", err?.message);
     }
   }
 
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect } = update;
-
+  sock.ev.on("connection.update", ({ connection }) => {
     if (connection === "open") {
-      console.log("✅ WhatsApp linked successfully!");
+      console.log("✅ Linked successfully!");
     }
-
     if (connection === "close") {
       console.log("❌ Connection closed.");
-      if (lastDisconnect?.error) {
-        console.log("Reason:", lastDisconnect.error?.message);
-      }
     }
   });
 }
