@@ -9,15 +9,12 @@
     "dev": "node --watch index.js"
   },
   "dependencies": {
-    "@itsukichan/baileys": "^7.3.2",
+    "@whiskeysockets/baileys": "^6.7.0",
     "cors": "^2.8.5",
     "express": "^4.18.2",
     "p-limit": "^5.0.0"
   },
   "engines": {
     "node": ">=18.0.0"
-  },
-  "keywords": ["whatsapp", "api", "baileys", "pairing-code"],
-  "author": "",
-  "license": "ISC"
+  }
 }
