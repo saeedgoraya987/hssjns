@@ -1,16 +1,23 @@
 {
-  "name": "telegram-whatsapp-bot",
-  "type": "module",
+  "name": "whatsapp-api-pairing",
   "version": "1.0.0",
-  "main": "bot.js",
+  "description": "WhatsApp API with pairing code authentication using Baileys",
+  "main": "index.js",
+  "type": "module",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.1",
-    "node-telegram-bot-api": "^0.66.0",
-    "qrcode": "^1.5.4",
-    "p-limit": "^4.0.0",
-    "dotenv": "^16.4.5"
-  }
+    "@whiskeysockets/baileys": "^6.7.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "p-limit": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["whatsapp", "api", "baileys", "pairing-code"],
+  "author": "",
+  "license": "ISC"
 }
