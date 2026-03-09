@@ -1,11 +1,13 @@
 import express from "express";
 import cors from "cors";
 import pLimit from "p-limit";
-import makeWASocket, {
+import * as Baileys from '@itsukichan/baileys';
+const {
+  default: makeWASocket,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason
-} from "@itsukichan/baileys";
+} = Baileys;
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
