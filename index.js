@@ -5,7 +5,7 @@ import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason
-} from "@whiskeysockets/baileys";
+} from "@itsukichan/baileys";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -54,7 +54,7 @@ async function startBaileys() {
     browser: ["Chrome (Linux)", "", ""], // correct format for pairing
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
-    shouldIgnoreJid: () => true,        // ignore all messages
+    shouldIgnoreJid: () => true,        // ignore all messages to save memory
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -143,81 +143,60 @@ app.get("/auth/qr", async (req, res) => {
   // Remove all non‑digits for the API call
   const cleanNumber = number.replace(/\D/g, "");
 
-  // Show a waiting page while we listen for the socket to be ready
-  // We'll set up a one‑time listener for the 'qr' event (which signals the socket is ready for auth)
-  // Then request the pairing code and redirect to a page that shows the code.
-  let responded = false;
+  // If the socket is already registered, we shouldn't be here (connected check above)
+  // But just in case, avoid requesting a code if already registered
+  if (sock.authState?.creds?.registered) {
+    return res.send(`
+      <html>
+        <head><title>WhatsApp Pairing</title></head>
+        <body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif">
+          <h2>✅ WhatsApp is already connected (registered).</h2>
+        </body>
+      </html>
+    `);
+  }
 
-  const timeout = setTimeout(() => {
-    if (!responded) {
-      responded = true;
-      res.status(500).send(`
-        <html>
-          <head><title>WhatsApp Pairing</title></head>
-          <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif">
-            <h2 style="color:red">Timeout waiting for WhatsApp connection</h2>
-            <p>Please try again.</p>
-            <a href="/auth/qr">Go back</a>
-          </body>
-        </html>
-      `);
-    }
-  }, 30000); // 30 second timeout
+  // Show a waiting page while we request the code
+  try {
+    // Give the socket a moment to settle (sometimes needed)
+    await new Promise(resolve => setTimeout(resolve, 2000));
 
-  const onReady = async () => {
-    if (responded) return;
-    clearTimeout(timeout);
-    sock.ev.off("connection.update", onReady);
-
-    try {
-      const pairingCode = await sock.requestPairingCode(cleanNumber);
-      if (!responded) {
-        responded = true;
-        res.send(`
-          <html>
-            <head>
-              <title>WhatsApp Pairing Code</title>
-              <meta http-equiv="refresh" content="60">
-            </head>
-            <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif">
-              <h2>Your pairing code</h2>
-              <div style="font-size:48px;letter-spacing:8px;background:#f0f0f0;padding:20px;border-radius:8px;margin:20px">
-                ${pairingCode}
-              </div>
-              <p>Open WhatsApp on your phone → Linked Devices → Link a Device</p>
-              <p style="color:#666">Enter the code above. This page will refresh in 60 seconds if not used.</p>
-            </body>
-          </html>
-        `);
-      }
-    } catch (err) {
-      console.error("Pairing code request error:", err);
-      if (!responded) {
-        responded = true;
-        res.status(500).send(`
-          <html>
-            <head><title>WhatsApp Pairing</title></head>
-            <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif">
-              <h2 style="color:red">Failed to generate pairing code</h2>
-              <p>${err.message || "Unknown error"}</p>
-              <a href="/auth/qr">Try again</a>
-            </body>
-          </html>
-        `);
-      }
-    }
-  };
-
-  sock.ev.on("connection.update", onReady);
-
-  // In case the socket is already in a state where the 'qr' event was emitted before we set the listener,
-  // we manually check if the socket is ready by calling requestPairingCode directly with a short timeout?
-  // Better to rely on the event. However, to be safe, we can also check if the socket has already emitted a 'qr'
-  // but that's tricky. We'll assume the event will fire.
+    const pairingCode = await sock.requestPairingCode(cleanNumber);
+    // The code often comes back with a hyphen, e.g. "ABCD-EFGH"
+    res.send(`
+      <html>
+        <head>
+          <title>WhatsApp Pairing Code</title>
+          <meta http-equiv="refresh" content="60">
+        </head>
+        <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif">
+          <h2>Your pairing code</h2>
+          <div style="font-size:48px;letter-spacing:8px;background:#f0f0f0;padding:20px;border-radius:8px;margin:20px">
+            ${pairingCode}
+          </div>
+          <p>Open WhatsApp on your phone → <strong>Settings → Linked Devices → Link a Device</strong></p>
+          <p>Then tap <strong>"Link with phone number instead"</strong> (at the bottom) and enter the code above.</p>
+          <p style="color:#666">The code expires in a few minutes. This page refreshes every 60 seconds.</p>
+        </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error("Pairing code request error:", err);
+    res.status(500).send(`
+      <html>
+        <head><title>WhatsApp Pairing</title></head>
+        <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif">
+          <h2 style="color:red">Failed to generate pairing code</h2>
+          <p>${err.message || "Unknown error"}</p>
+          <p>Make sure you have deleted the old <code>./auth</code> folder and restarted the server.</p>
+          <a href="/auth/qr">Try again</a>
+        </body>
+      </html>
+    `);
+  }
 });
 
 // check a single number
-// body: { "number": "+13039003684" }
 app.post("/check", async (req, res) => {
   if (!connectionState.connected) {
     return res.status(503).json(envelopeError(503, req.path, "WhatsApp not connected; open /auth/qr and pair your phone"));
@@ -238,7 +217,6 @@ app.post("/check", async (req, res) => {
 });
 
 // batch check many numbers
-// body: { "numbers": ["+13039003684", "+441234567890", ...] }
 app.post("/batch", async (req, res) => {
   if (!connectionState.connected) {
     return res.status(503).json(envelopeError(503, req.path, "WhatsApp not connected; open /auth/qr and pair your phone"));
