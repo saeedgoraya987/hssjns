@@ -1,13 +1,11 @@
 import express from "express";
 import cors from "cors";
 import pLimit from "p-limit";
-import * as Baileys from '@itsukichan/baileys';
-const {
-  default: makeWASocket,
+import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason
-} = Baileys;
+} from "@whiskeysockets/baileys";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -94,7 +92,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// --- PAIRING CODE page (replaces QR) ---
+// --- PAIRING CODE page ---
 app.get("/auth/qr", async (req, res) => {
   // If already connected, no need for pairing
   if (connectionState.connected) {
