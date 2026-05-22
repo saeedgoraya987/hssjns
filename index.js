@@ -7,7 +7,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   DisconnectReason,
   makeCacheableSignalKeyStore
-} from "@alannxd/baileys"; // Changed to @alannxd/baileys
+} from "@alannxd/baileys";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -25,11 +25,11 @@ app.use(express.json({ limit: "2mb" }));
 const MAX_CONCURRENCY = 16;
 const PHONE_RE = /^\+?\d{8,18}$/;
 const limit = pLimit(MAX_CONCURRENCY);
+const PORT = process.env.PORT || 8080;
 
 // Custom pairing code configuration
 const USE_CUSTOM_PAIRING = process.env.USE_CUSTOM_PAIRING === "true";
-const CUSTOM_PAIRING_CODE = process.env.CUSTOM_PAIRING_CODE || "12345678"; // Your custom code
-const PAIRING_CODE_LENGTH = parseInt(process.env.PAIRING_CODE_LENGTH || "8");
+const CUSTOM_PAIRING_CODE = process.env.CUSTOM_PAIRING_CODE || "12345678";
 
 // ---------- helpers ----------
 const normalizeNumber = (raw) => {
@@ -45,98 +45,153 @@ const envelopeError = (statusCode, path, message) => ({
   message
 });
 
-// ---------- Baileys lifecycle ----------
-let sock = null;
-let connectionState = { connected: false, lastDisconnect: null };
-let latestQR = null;
-const msgRetryCounterCache = new NodeCache();
-
-// Logger configuration
-const logger = pino({ 
+// ---------- Simple logger for production ----------
+const logger = pino({
   level: process.env.LOG_LEVEL || "info",
-  transport: {
+  transport: process.env.NODE_ENV === "production" ? undefined : {
     target: 'pino-pretty',
     options: { colorize: true }
   }
 });
 
+// ---------- Baileys lifecycle ----------
+let sock = null;
+let connectionState = { connected: false, lastDisconnect: null };
+let latestQR = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const msgRetryCounterCache = new NodeCache();
+
 async function startBaileys() {
-  const authDir = path.join(__dirname, "auth");
-  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
+  // Don't try to reconnect if we already have a connection in progress
+  if (sock && sock.user) {
+    logger.info("Socket already exists, skipping...");
+    return;
+  }
 
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version } = await fetchLatestBaileysVersion();
+  try {
+    const authDir = path.join(__dirname, "auth");
+    if (!fs.existsSync(authDir)) {
+      fs.mkdirSync(authDir, { recursive: true });
+    }
 
-  sock = makeWASocket({
-    version,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger)
-    },
-    logger,
-    printQRInTerminal: true,
-    browser: ["API", "Chrome", "1.0"],
-    markOnlineOnConnect: true,
-    // Custom pairing configuration for @alannxd/baileys
-    pairingCode: USE_CUSTOM_PAIRING ? CUSTOM_PAIRING_CODE : undefined,
-    // Additional options for better stability
-    connectTimeoutMs: 60_000,
-    keepAliveIntervalMs: 25_000,
-    qrTimeout: 40_000,
-    defaultQueryTimeoutMs: 60_000
-  });
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", async (u) => {
-    const { connection, lastDisconnect, qr } = u;
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
     
-    if (qr) {
-      latestQR = qr;
-      logger.info("📱 New QR code received");
+    // Check if we're already logged in
+    if (state.creds.registered) {
+      logger.info("Found existing session, attempting to connect...");
     }
 
-    if (connection === "open") {
-      connectionState = { connected: true, lastDisconnect: null };
-      latestQR = null;
-      logger.info("✅ WhatsApp connected successfully");
-      
-      // Get and display device info
-      try {
-        const user = sock.user;
-        logger.info(`👤 Connected as: ${user?.name || user?.id?.split(':')[0]}`);
-      } catch (e) {
-        // Ignore
-      }
-    } else if (connection === "close") {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      
-      connectionState = { 
-        connected: false, 
-        lastDisconnect: lastDisconnect?.error?.output?.payload || code || "unknown" 
-      };
-      
-      logger.warn(`❌ Connection closed: ${JSON.stringify(connectionState.lastDisconnect)}`);
+    const { version } = await fetchLatestBaileysVersion();
+    logger.info(`Using Baileys version: ${version.join(".")}`);
 
-      if (shouldReconnect) {
-        logger.info("🔄 Attempting to reconnect in 5 seconds...");
-        setTimeout(() => {
-          startBaileys().catch(e => logger.error("Reconnection failed:", e));
-        }, 5000);
-      } else {
-        logger.info("🚫 Logged out. Delete ./auth folder to re-link.");
+    sock = makeWASocket({
+      version,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger)
+      },
+      logger,
+      printQRInTerminal: true,
+      browser: ["API", "Chrome", "1.0"],
+      markOnlineOnConnect: true,
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 25000,
+      qrTimeout: 40000,
+      defaultQueryTimeoutMs: 60000,
+      // Pairing code configuration
+      pairingCode: USE_CUSTOM_PAIRING ? CUSTOM_PAIRING_CODE : undefined,
+    });
+
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("connection.update", async (u) => {
+      const { connection, lastDisconnect, qr } = u;
+      
+      if (qr) {
+        latestQR = qr;
+        logger.info("📱 New QR code received");
       }
-    } else if (connection === "connecting") {
-      logger.info("🔄 Connecting to WhatsApp...");
+
+      if (connection === "open") {
+        connectionState = { connected: true, lastDisconnect: null };
+        latestQR = null;
+        reconnectAttempts = 0; // Reset reconnect attempts on successful connection
+        logger.info("✅ WhatsApp connected successfully");
+        
+        try {
+          logger.info(`👤 Connected as: ${sock.user?.name || 'Unknown'}`);
+        } catch (e) {
+          // Ignore
+        }
+      } else if (connection === "close") {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        
+        connectionState = { 
+          connected: false, 
+          lastDisconnect: lastDisconnect?.error?.message || statusCode || "unknown" 
+        };
+        
+        logger.warn(`❌ Connection closed: ${JSON.stringify(connectionState.lastDisconnect)}`);
+
+        if (shouldReconnect && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+          reconnectAttempts++;
+          const delay = Math.min(5000 * reconnectAttempts, 30000); // Exponential backoff, max 30s
+          logger.info(`🔄 Reconnecting in ${delay/1000}s... (Attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+          
+          // Clean up old socket
+          sock = null;
+          
+          setTimeout(() => {
+            startBaileys().catch(err => {
+              logger.error("Reconnection failed:", err.message);
+            });
+          }, delay);
+        } else if (statusCode === DisconnectReason.loggedOut) {
+          logger.info("🚫 Logged out. Delete the 'auth' folder to re-link.");
+        } else {
+          logger.error("❌ Max reconnection attempts reached. Please restart the service.");
+        }
+      } else if (connection === "connecting") {
+        logger.info("🔄 Connecting to WhatsApp...");
+      }
+    });
+
+  } catch (error) {
+    logger.error(`Failed to initialize Baileys: ${error.message}`);
+    logger.error(error.stack);
+    
+    // Retry with delay if it's an initialization error
+    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      reconnectAttempts++;
+      const delay = Math.min(10000 * reconnectAttempts, 60000);
+      logger.info(`Retrying initialization in ${delay/1000}s...`);
+      setTimeout(() => {
+        startBaileys().catch(err => {
+          logger.error("Retry failed:", err.message);
+        });
+      }, delay);
+    } else {
+      logger.error("Max initialization attempts reached. Service will continue without WhatsApp.");
     }
-  });
+  }
 }
 
-// Initialize connection
-startBaileys().catch(err => {
-  logger.error("Failed to start Baileys:", err);
-  process.exit(1);
+// Start the server first, then try to connect to WhatsApp
+app.listen(PORT, () => {
+  logger.info(`🚀 Server running on http://0.0.0.0:${PORT}`);
+  logger.info(`📱 QR Code: http://0.0.0.0:${PORT}/auth/qr`);
+  logger.info(`🔑 Pairing: http://0.0.0.0:${PORT}/auth/pair`);
+  
+  if (USE_CUSTOM_PAIRING) {
+    logger.info(`⚡ Custom pairing code enabled: ${CUSTOM_PAIRING_CODE}`);
+  }
+  
+  // Initialize WhatsApp connection after server is ready
+  startBaileys().catch(err => {
+    logger.error("Failed to start Baileys:", err.message);
+  });
 });
 
 // ---------- routes ----------
@@ -147,6 +202,7 @@ app.get("/health", (req, res) => {
     ok: true,
     connected: connectionState.connected,
     lastDisconnect: connectionState.lastDisconnect ? String(connectionState.lastDisconnect) : null,
+    reconnectAttempts,
     user: sock?.user ? {
       name: sock.user.name,
       number: sock.user.id?.split(':')[0]
@@ -159,9 +215,15 @@ app.get("/auth/qr", async (req, res) => {
   if (connectionState.connected) {
     res.send(`
       <html>
-        <head><title>WhatsApp QR</title></head>
-        <body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif">
-          <h2>✅ WhatsApp is already connected as ${sock?.user?.name || 'Unknown'}</h2>
+        <head><title>WhatsApp QR</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+        </head>
+        <body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#f0f2f5;margin:0">
+          <div style="background:white;padding:2rem;border-radius:10px;text-align:center;box-shadow:0 2px 10px rgba(0,0,0,0.1)">
+            <h2>✅ WhatsApp Connected</h2>
+            <p>Connected as: ${sock?.user?.name || 'Unknown'}</p>
+            <p><a href="/auth/pair">Switch to pairing code</a></p>
+          </div>
         </body>
       </html>
     `);
@@ -172,12 +234,15 @@ app.get("/auth/qr", async (req, res) => {
     res.send(`
       <html>
         <head><title>WhatsApp QR</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
           <meta http-equiv="refresh" content="5">
         </head>
-        <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif">
-          <h2>⏳ Generating QR Code...</h2>
-          <p>This page refreshes every 5 seconds</p>
-          <p>Or use <a href="/auth/pair">pairing code</a> instead</p>
+        <body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#f0f2f5;margin:0">
+          <div style="background:white;padding:2rem;border-radius:10px;text-align:center;box-shadow:0 2px 10px rgba(0,0,0,0.1)">
+            <h2>⏳ Generating QR Code...</h2>
+            <p>This page refreshes every 5 seconds</p>
+            <p><a href="/auth/pair">Use pairing code instead</a></p>
+          </div>
         </body>
       </html>
     `);
@@ -187,27 +252,26 @@ app.get("/auth/qr", async (req, res) => {
   try {
     const dataUrl = await QRCode.toDataURL(latestQR, { 
       margin: 2, 
-      width: 400,
-      color: {
-        dark: "#000000",
-        light: "#ffffff"
-      }
+      width: 400 
     });
     
     res.send(`
       <html>
         <head>
           <title>WhatsApp QR Code</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
           <meta http-equiv="refresh" content="20">
           <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
             body {
               display: flex;
               flex-direction: column;
               align-items: center;
               justify-content: center;
-              height: 100vh;
-              font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+              min-height: 100vh;
+              font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
               background: #f0f2f5;
+              padding: 20px;
             }
             .container {
               background: white;
@@ -215,29 +279,28 @@ app.get("/auth/qr", async (req, res) => {
               border-radius: 10px;
               box-shadow: 0 2px 10px rgba(0,0,0,0.1);
               text-align: center;
+              max-width: 450px;
+              width: 100%;
             }
             img {
               border: 3px solid #25D366;
               border-radius: 10px;
+              max-width: 100%;
+              height: auto;
             }
-            .hint {
-              color: #666;
-              margin-top: 1rem;
-            }
-            .pair-link {
-              margin-top: 1rem;
-              color: #128C7E;
-            }
+            .hint { color: #666; margin-top: 1rem; font-size: 14px; }
+            .pair-link { margin-top: 1rem; }
+            .pair-link a { color: #128C7E; text-decoration: none; }
           </style>
         </head>
         <body>
           <div class="container">
             <h2>📱 Scan QR Code</h2>
             <p>Open WhatsApp → Settings → Linked Devices</p>
-            <img src="${dataUrl}" alt="WhatsApp QR" style="width:350px;height:350px" />
-            <p class="hint">This page auto-refreshes every 20s</p>
+            <img src="${dataUrl}" alt="WhatsApp QR" />
+            <p class="hint">Page auto-refreshes every 20 seconds</p>
             <p class="pair-link">
-              <a href="/auth/pair">Use Pairing Code instead →</a>
+              <a href="/auth/pair">Use Pairing Code →</a>
             </p>
           </div>
         </body>
@@ -272,9 +335,15 @@ app.get("/auth/pair", async (req, res) => {
   if (connectionState.connected) {
     res.send(`
       <html>
-        <head><title>WhatsApp Pairing</title></head>
-        <body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif">
-          <h2>✅ WhatsApp is already connected as ${sock?.user?.name || 'Unknown'}</h2>
+        <head><title>WhatsApp Pairing</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+        </head>
+        <body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#f0f2f5;margin:0">
+          <div style="background:white;padding:2rem;border-radius:10px;text-align:center;box-shadow:0 2px 10px rgba(0,0,0,0.1)">
+            <h2>✅ WhatsApp Connected</h2>
+            <p>Connected as: ${sock?.user?.name || 'Unknown'}</p>
+            <p><a href="/auth/qr">Back to QR code</a></p>
+          </div>
         </body>
       </html>
     `);
@@ -285,6 +354,7 @@ app.get("/auth/pair", async (req, res) => {
     <html>
       <head>
         <title>WhatsApp Pairing Code</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
           * { margin: 0; padding: 0; box-sizing: border-box; }
           body { 
@@ -295,6 +365,7 @@ app.get("/auth/pair", async (req, res) => {
             min-height: 100vh; 
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: #f0f2f5;
+            padding: 20px;
           }
           .container {
             background: white;
@@ -302,11 +373,11 @@ app.get("/auth/pair", async (req, res) => {
             border-radius: 10px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
             max-width: 450px;
-            width: 90%;
+            width: 100%;
           }
-          h2 { color: #075e54; margin-bottom: 1rem; }
-          .info { color: #666; margin-bottom: 1rem; font-size: 14px; }
-          input, select {
+          h2 { color: #075e54; margin-bottom: 1rem; text-align: center; }
+          .info { color: #666; margin-bottom: 1rem; font-size: 14px; text-align: center; }
+          input {
             width: 100%;
             padding: 12px;
             margin: 8px 0;
@@ -343,50 +414,43 @@ app.get("/auth/pair", async (req, res) => {
             color: #075e54;
             margin: 15px 0;
           }
-          .qr-link { margin-top: 15px; }
-          .custom-code-info { 
-            background: #fff3cd; 
-            color: #856404; 
-            padding: 10px; 
-            border-radius: 5px; 
-            margin: 10px 0;
-            font-size: 14px;
+          .qr-link { 
+            margin-top: 15px; 
+            text-align: center;
           }
+          .qr-link a { color: #128C7E; text-decoration: none; }
+          ${USE_CUSTOM_PAIRING ? `
+            .custom-code-info { 
+              background: #fff3cd; 
+              color: #856404; 
+              padding: 10px; 
+              border-radius: 5px; 
+              margin: 10px 0;
+              font-size: 14px;
+              text-align: center;
+            }
+          ` : ''}
         </style>
       </head>
       <body>
         <div class="container">
           <h2>🔑 WhatsApp Pairing</h2>
-          <p class="info">
-            Link your WhatsApp account using a pairing code.<br>
-            WhatsApp → Settings → Linked Devices → Link with Phone Number
-          </p>
+          <p class="info">Link your WhatsApp account using a pairing code</p>
           
           ${USE_CUSTOM_PAIRING ? `
             <div class="custom-code-info">
               ⚡ Custom pairing mode enabled<br>
-              Your pairing code is: <strong>${CUSTOM_PAIRING_CODE}</strong><br>
-              <small>Use this code directly or request a new one</small>
+              Your code: <strong>${CUSTOM_PAIRING_CODE}</strong>
             </div>
           ` : ''}
           
           <input type="text" id="phoneNumber" placeholder="Phone number (e.g., +1234567890)" />
-          
-          ${USE_CUSTOM_PAIRING ? `
-            <select id="codeType">
-              <option value="custom">Use Custom Code: ${CUSTOM_PAIRING_CODE}</option>
-              <option value="generate">Generate New Code</option>
-            </select>
-          ` : ''}
-          
           <button id="requestBtn" onclick="requestPairingCode()">
-            ${USE_CUSTOM_PAIRING ? 'Use Pairing Code' : 'Get Pairing Code'}
+            Get Pairing Code
           </button>
-          
           <div id="result"></div>
-          
           <p class="qr-link">
-            <a href="/auth/qr">← Use QR Code instead</a>
+            <a href="/auth/qr">← Use QR Code</a>
           </p>
         </div>
 
@@ -402,7 +466,6 @@ app.get("/auth/pair", async (req, res) => {
               return;
             }
 
-            // Validate phone number
             const cleaned = phoneNumber.replace(/\\D/g, '');
             if (cleaned.length < 8 || cleaned.length > 18) {
               resultDiv.className = 'error';
@@ -411,53 +474,38 @@ app.get("/auth/pair", async (req, res) => {
             }
 
             requestBtn.disabled = true;
-            requestBtn.textContent = 'Processing...';
+            requestBtn.textContent = 'Requesting...';
             resultDiv.className = '';
             resultDiv.textContent = '⏳ Requesting pairing code...';
             resultDiv.style.display = 'block';
 
             try {
-              ${USE_CUSTOM_PAIRING ? `
-                const codeType = document.getElementById('codeType')?.value || 'generate';
-                const useCustom = codeType === 'custom';
-                
-                const response = await fetch('/auth/pair-code', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ 
-                    phoneNumber,
-                    useCustomCode: useCustom,
-                    customCode: useCustom ? '${CUSTOM_PAIRING_CODE}' : undefined
-                  })
-                });
-              ` : `
-                const response = await fetch('/auth/pair-code', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ phoneNumber })
-                });
-              `}
+              const response = await fetch('/auth/pair-code', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phoneNumber })
+              });
 
               const data = await response.json();
               
               if (data.success) {
                 resultDiv.className = 'success';
                 resultDiv.innerHTML = \`
-                  <strong>✅ Your Pairing Code:</strong>
+                  <strong>✅ Pairing Code:</strong>
                   <div class="code-display">\${data.code}</div>
-                  <p>Enter this code in your WhatsApp app</p>
-                  <small>⏰ Code expires in \${data.expiresIn || 60} seconds</small>
+                  <p>Enter this code in WhatsApp</p>
+                  <small>Settings → Linked Devices → Link with Phone Number</small>
                 \`;
               } else {
                 resultDiv.className = 'error';
-                resultDiv.textContent = '❌ ' + (data.message || 'Failed to get pairing code');
+                resultDiv.textContent = '❌ ' + (data.message || 'Failed to get code');
               }
             } catch (error) {
               resultDiv.className = 'error';
               resultDiv.textContent = '❌ Error: ' + error.message;
             } finally {
               requestBtn.disabled = false;
-              requestBtn.textContent = '${USE_CUSTOM_PAIRING ? 'Try Again' : 'Get Pairing Code'}';
+              requestBtn.textContent = 'Get Pairing Code';
             }
           }
         </script>
@@ -472,7 +520,11 @@ app.post("/auth/pair-code", async (req, res) => {
     return res.json({ success: false, message: "Already connected to WhatsApp" });
   }
 
-  const { phoneNumber, useCustomCode, customCode } = req.body;
+  if (!sock) {
+    return res.json({ success: false, message: "WhatsApp client not initialized yet. Please wait..." });
+  }
+
+  const { phoneNumber } = req.body;
   
   if (!phoneNumber) {
     return res.json({ success: false, message: "Phone number is required" });
@@ -485,28 +537,20 @@ app.post("/auth/pair-code", async (req, res) => {
       return res.json({ success: false, message: "Invalid phone number format" });
     }
 
-    let code;
-    
-    if (USE_CUSTOM_PAIRING && useCustomCode && customCode) {
-      // Use custom pairing code
-      code = await sock.requestPairingCode(cleaned, customCode);
-    } else {
-      // Generate random pairing code
-      code = await sock.requestPairingCode(cleaned);
-    }
+    logger.info(`Requesting pairing code for: ${cleaned}`);
+    const code = await sock.requestPairingCode(cleaned);
     
     if (code) {
-      logger.info(`📱 Pairing code generated for ${cleaned}: ${code}`);
+      logger.info(`Pairing code generated: ${code}`);
       return res.json({ 
         success: true, 
         code: code,
-        expiresIn: 60,
-        message: "Enter this code in your WhatsApp app (Linked Devices → Link with Phone Number)" 
+        message: "Enter this code in WhatsApp (Linked Devices → Link with Phone Number)" 
       });
     } else {
       return res.json({ 
         success: false, 
-        message: "Failed to generate pairing code. Please try again." 
+        message: "Failed to generate pairing code. Try scanning QR code instead." 
       });
     }
   } catch (error) {
@@ -586,6 +630,7 @@ app.post("/auth/logout", async (req, res) => {
       await sock.logout();
       connectionState.connected = false;
       latestQR = null;
+      reconnectAttempts = 0;
       return res.json({ success: true, message: "Logged out successfully" });
     } catch (error) {
       return res.status(500).json({ success: false, message: "Logout failed: " + error.message });
@@ -598,16 +643,4 @@ app.post("/auth/logout", async (req, res) => {
 app.use((err, req, res, _next) => {
   logger.error("Unhandled error:", err);
   res.status(400).json(envelopeError(400, req?.path || "/", "Unexpected error"));
-});
-
-// Start server
-const PORT = process.env.PORT || 8000;
-app.listen(PORT, () => {
-  logger.info(`🚀 Server running on http://0.0.0.0:${PORT}`);
-  logger.info(`📱 QR Code: http://0.0.0.0:${PORT}/auth/qr`);
-  logger.info(`🔑 Pairing: http://0.0.0.0:${PORT}/auth/pair`);
-  
-  if (USE_CUSTOM_PAIRING) {
-    logger.info(`⚡ Custom pairing code: ${CUSTOM_PAIRING_CODE}`);
-  }
 });
