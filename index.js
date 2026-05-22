@@ -48,10 +48,10 @@ const envelopeError = (statusCode, path, message) => ({
 // ---------- Simple logger for production ----------
 const logger = pino({
   level: process.env.LOG_LEVEL || "info",
-  transport: process.env.NODE_ENV === "production" ? undefined : {
+  transport: process.env.NODE_ENV !== "production" ? {
     target: 'pino-pretty',
     options: { colorize: true }
-  }
+  } : undefined
 });
 
 // ---------- Baileys lifecycle ----------
@@ -59,32 +59,57 @@ let sock = null;
 let connectionState = { connected: false, lastDisconnect: null };
 let latestQR = null;
 let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 5;
+const MAX_RECONNECT_ATTEMPTS = 3; // Reduced to prevent rapid restart loops
+let isInitializing = false; // Prevent multiple simultaneous initializations
 const msgRetryCounterCache = new NodeCache();
 
 async function startBaileys() {
-  // Don't try to reconnect if we already have a connection in progress
-  if (sock && sock.user) {
-    logger.info("Socket already exists, skipping...");
+  // Prevent multiple simultaneous initialization attempts
+  if (isInitializing) {
+    logger.warn("Baileys initialization already in progress, skipping...");
+    return;
+  }
+  
+  // Don't try to reconnect if we already have a working connection
+  if (sock?.user) {
+    logger.info("Socket already connected, skipping initialization...");
     return;
   }
 
+  isInitializing = true;
+
   try {
     const authDir = path.join(__dirname, "auth");
+    logger.info(`Checking auth directory: ${authDir}`);
+    
     if (!fs.existsSync(authDir)) {
+      logger.info("Creating auth directory...");
       fs.mkdirSync(authDir, { recursive: true });
     }
 
+    logger.info("Loading auth state...");
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
     
     // Check if we're already logged in
-    if (state.creds.registered) {
+    if (state.creds?.registered) {
       logger.info("Found existing session, attempting to connect...");
+    } else {
+      logger.info("No existing session found, waiting for QR/pairing...");
     }
 
-    const { version } = await fetchLatestBaileysVersion();
-    logger.info(`Using Baileys version: ${version.join(".")}`);
+    logger.info("Fetching latest Baileys version...");
+    let version;
+    try {
+      const versionResult = await fetchLatestBaileysVersion();
+      version = versionResult.version;
+      logger.info(`Using Baileys version: ${version.join(".")}`);
+    } catch (versionError) {
+      logger.error("Failed to fetch Baileys version:", versionError.message);
+      logger.info("Using default version...");
+      version = [2, 3000, 0]; // Fallback version
+    }
 
+    logger.info("Creating WhatsApp socket...");
     sock = makeWASocket({
       version,
       auth: {
@@ -103,7 +128,12 @@ async function startBaileys() {
       pairingCode: USE_CUSTOM_PAIRING ? CUSTOM_PAIRING_CODE : undefined,
     });
 
-    sock.ev.on("creds.update", saveCreds);
+    logger.info("Setting up event listeners...");
+    
+    sock.ev.on("creds.update", (creds) => {
+      logger.info("Credentials updated, saving...");
+      saveCreds();
+    });
 
     sock.ev.on("connection.update", async (u) => {
       const { connection, lastDisconnect, qr } = u;
@@ -116,28 +146,31 @@ async function startBaileys() {
       if (connection === "open") {
         connectionState = { connected: true, lastDisconnect: null };
         latestQR = null;
-        reconnectAttempts = 0; // Reset reconnect attempts on successful connection
+        reconnectAttempts = 0;
+        isInitializing = false;
         logger.info("✅ WhatsApp connected successfully");
         
         try {
-          logger.info(`👤 Connected as: ${sock.user?.name || 'Unknown'}`);
+          logger.info(`👤 Connected as: ${sock.user?.name || sock.user?.id || 'Unknown'}`);
         } catch (e) {
-          // Ignore
+          logger.info("Connected but couldn't get user info");
         }
       } else if (connection === "close") {
+        isInitializing = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const errorMessage = lastDisconnect?.error?.message || lastDisconnect?.error?.toString() || "Unknown error";
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         
         connectionState = { 
           connected: false, 
-          lastDisconnect: lastDisconnect?.error?.message || statusCode || "unknown" 
+          lastDisconnect: errorMessage 
         };
         
-        logger.warn(`❌ Connection closed: ${JSON.stringify(connectionState.lastDisconnect)}`);
+        logger.error(`❌ Connection closed: Status=${statusCode}, Error=${errorMessage}`);
 
         if (shouldReconnect && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
           reconnectAttempts++;
-          const delay = Math.min(5000 * reconnectAttempts, 30000); // Exponential backoff, max 30s
+          const delay = Math.min(10000 * reconnectAttempts, 30000);
           logger.info(`🔄 Reconnecting in ${delay/1000}s... (Attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
           
           // Clean up old socket
@@ -145,35 +178,62 @@ async function startBaileys() {
           
           setTimeout(() => {
             startBaileys().catch(err => {
-              logger.error("Reconnection failed:", err.message);
+              logger.error(`Reconnection attempt ${reconnectAttempts} failed:`, err.message);
+              logger.error("Full error:", err.stack);
             });
           }, delay);
         } else if (statusCode === DisconnectReason.loggedOut) {
-          logger.info("🚫 Logged out. Delete the 'auth' folder to re-link.");
+          logger.info("🚫 Session logged out. Delete the 'auth' folder to re-link.");
+          sock = null;
         } else {
-          logger.error("❌ Max reconnection attempts reached. Please restart the service.");
+          logger.error(`❌ Max reconnection attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Service will continue without WhatsApp.`);
+          logger.info("To restart WhatsApp connection, call POST /auth/restart");
+          sock = null;
         }
       } else if (connection === "connecting") {
         logger.info("🔄 Connecting to WhatsApp...");
       }
     });
 
+    // Handle unexpected errors
+    sock.ev.on("messages.upsert", () => {
+      // Just to keep the connection alive
+    });
+
+    logger.info("Baileys initialization complete. Waiting for connection...");
+    isInitializing = false;
+
   } catch (error) {
-    logger.error(`Failed to initialize Baileys: ${error.message}`);
-    logger.error(error.stack);
+    isInitializing = false;
+    logger.error("Failed to initialize Baileys:");
+    logger.error(`Error name: ${error.name}`);
+    logger.error(`Error message: ${error.message}`);
+    logger.error(`Error stack: ${error.stack}`);
+    
+    // Log the full error object
+    if (error.cause) {
+      logger.error(`Error cause: ${JSON.stringify(error.cause)}`);
+    }
+    if (error.code) {
+      logger.error(`Error code: ${error.code}`);
+    }
     
     // Retry with delay if it's an initialization error
     if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
       reconnectAttempts++;
-      const delay = Math.min(10000 * reconnectAttempts, 60000);
-      logger.info(`Retrying initialization in ${delay/1000}s...`);
+      const delay = Math.min(15000 * reconnectAttempts, 60000);
+      logger.info(`Retrying initialization in ${delay/1000}s... (Attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+      
+      sock = null;
+      
       setTimeout(() => {
         startBaileys().catch(err => {
-          logger.error("Retry failed:", err.message);
+          logger.error(`Retry ${reconnectAttempts} failed:`, err.message);
         });
       }, delay);
     } else {
-      logger.error("Max initialization attempts reached. Service will continue without WhatsApp.");
+      logger.error(`Max initialization attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Service will continue without WhatsApp.`);
+      logger.info("To restart WhatsApp connection, call POST /auth/restart");
     }
   }
 }
@@ -183,15 +243,20 @@ app.listen(PORT, () => {
   logger.info(`🚀 Server running on http://0.0.0.0:${PORT}`);
   logger.info(`📱 QR Code: http://0.0.0.0:${PORT}/auth/qr`);
   logger.info(`🔑 Pairing: http://0.0.0.0:${PORT}/auth/pair`);
+  logger.info(`🏥 Health: http://0.0.0.0:${PORT}/health`);
   
   if (USE_CUSTOM_PAIRING) {
     logger.info(`⚡ Custom pairing code enabled: ${CUSTOM_PAIRING_CODE}`);
   }
   
+  logger.info("Starting WhatsApp connection in 2 seconds...");
   // Initialize WhatsApp connection after server is ready
-  startBaileys().catch(err => {
-    logger.error("Failed to start Baileys:", err.message);
-  });
+  setTimeout(() => {
+    startBaileys().catch(err => {
+      logger.error("Failed to start Baileys:", err.message);
+      logger.error("Full error:", err.stack);
+    });
+  }, 2000);
 });
 
 // ---------- routes ----------
@@ -203,11 +268,30 @@ app.get("/health", (req, res) => {
     connected: connectionState.connected,
     lastDisconnect: connectionState.lastDisconnect ? String(connectionState.lastDisconnect) : null,
     reconnectAttempts,
+    isInitializing,
     user: sock?.user ? {
       name: sock.user.name,
       number: sock.user.id?.split(':')[0]
     } : null
   });
+});
+
+// Restart WhatsApp connection
+app.post("/auth/restart", async (req, res) => {
+  reconnectAttempts = 0;
+  isInitializing = false;
+  sock = null;
+  latestQR = null;
+  
+  logger.info("Manual restart requested");
+  res.json({ success: true, message: "Restarting WhatsApp connection..." });
+  
+  // Restart after a short delay
+  setTimeout(() => {
+    startBaileys().catch(err => {
+      logger.error("Restart failed:", err.message);
+    });
+  }, 1000);
 });
 
 // QR Code page
@@ -223,6 +307,7 @@ app.get("/auth/qr", async (req, res) => {
             <h2>✅ WhatsApp Connected</h2>
             <p>Connected as: ${sock?.user?.name || 'Unknown'}</p>
             <p><a href="/auth/pair">Switch to pairing code</a></p>
+            <p><a href="/health">Check health status</a></p>
           </div>
         </body>
       </html>
@@ -241,7 +326,9 @@ app.get("/auth/qr", async (req, res) => {
           <div style="background:white;padding:2rem;border-radius:10px;text-align:center;box-shadow:0 2px 10px rgba(0,0,0,0.1)">
             <h2>⏳ Generating QR Code...</h2>
             <p>This page refreshes every 5 seconds</p>
+            <p>Connection attempts: ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}</p>
             <p><a href="/auth/pair">Use pairing code instead</a></p>
+            <p><a href="/health">Check health status</a></p>
           </div>
         </body>
       </html>
@@ -290,7 +377,7 @@ app.get("/auth/qr", async (req, res) => {
             }
             .hint { color: #666; margin-top: 1rem; font-size: 14px; }
             .pair-link { margin-top: 1rem; }
-            .pair-link a { color: #128C7E; text-decoration: none; }
+            .pair-link a { color: #128C7E; text-decoration: none; margin: 0 10px; }
           </style>
         </head>
         <body>
@@ -301,6 +388,7 @@ app.get("/auth/qr", async (req, res) => {
             <p class="hint">Page auto-refreshes every 20 seconds</p>
             <p class="pair-link">
               <a href="/auth/pair">Use Pairing Code →</a>
+              <a href="/health">Health Status</a>
             </p>
           </div>
         </body>
@@ -319,7 +407,13 @@ app.get("/auth/qr-raw", async (req, res) => {
   }
   
   if (!latestQR) {
-    return res.json({ connected: false, qr: null, message: "QR not yet generated" });
+    return res.json({ 
+      connected: false, 
+      qr: null, 
+      message: "QR not yet generated",
+      reconnectAttempts,
+      maxAttempts: MAX_RECONNECT_ATTEMPTS
+    });
   }
   
   try {
@@ -414,11 +508,11 @@ app.get("/auth/pair", async (req, res) => {
             color: #075e54;
             margin: 15px 0;
           }
-          .qr-link { 
+          .links { 
             margin-top: 15px; 
             text-align: center;
           }
-          .qr-link a { color: #128C7E; text-decoration: none; }
+          .links a { color: #128C7E; text-decoration: none; margin: 0 10px; }
           ${USE_CUSTOM_PAIRING ? `
             .custom-code-info { 
               background: #fff3cd; 
@@ -436,6 +530,9 @@ app.get("/auth/pair", async (req, res) => {
         <div class="container">
           <h2>🔑 WhatsApp Pairing</h2>
           <p class="info">Link your WhatsApp account using a pairing code</p>
+          <p style="text-align:center;color:#666;font-size:12px;margin-bottom:10px;">
+            Connection attempts: ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}
+          </p>
           
           ${USE_CUSTOM_PAIRING ? `
             <div class="custom-code-info">
@@ -449,9 +546,10 @@ app.get("/auth/pair", async (req, res) => {
             Get Pairing Code
           </button>
           <div id="result"></div>
-          <p class="qr-link">
+          <div class="links">
             <a href="/auth/qr">← Use QR Code</a>
-          </p>
+            <a href="/health">Health Status</a>
+          </div>
         </div>
 
         <script>
@@ -521,7 +619,10 @@ app.post("/auth/pair-code", async (req, res) => {
   }
 
   if (!sock) {
-    return res.json({ success: false, message: "WhatsApp client not initialized yet. Please wait..." });
+    return res.json({ 
+      success: false, 
+      message: "WhatsApp client not initialized yet. Check /health for status." 
+    });
   }
 
   const { phoneNumber } = req.body;
@@ -554,7 +655,7 @@ app.post("/auth/pair-code", async (req, res) => {
       });
     }
   } catch (error) {
-    logger.error("Pairing code error:", error);
+    logger.error("Pairing code error:", error.message);
     return res.json({ 
       success: false, 
       message: "Error: " + error.message 
@@ -641,6 +742,20 @@ app.post("/auth/logout", async (req, res) => {
 
 // Error handler
 app.use((err, req, res, _next) => {
-  logger.error("Unhandled error:", err);
-  res.status(400).json(envelopeError(400, req?.path || "/", "Unexpected error"));
+  logger.error("Unhandled error:", err.message);
+  logger.error("Stack:", err.stack);
+  res.status(400).json(envelopeError(400, req?.path || "/", "Unexpected error: " + err.message));
+});
+
+// Handle uncaught errors to prevent crashes
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception:', error.message);
+  logger.error(error.stack);
+  // Don't exit, let the app continue running
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection at:', promise);
+  logger.error('Reason:', reason);
+  // Don't exit, let the app continue running
 });
